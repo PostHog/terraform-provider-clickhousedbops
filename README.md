@@ -11,6 +11,7 @@ With this Terraform provider you can:
 - Manage `databases` in a `ClickHouse` instance using the `clickhousedbops_database` resource
 - Manage `dictionaries` in a `ClickHouse` instance using the `clickhousedbops_dictionary` resource
 - Manage `tables` in a `ClickHouse` instance using the `clickhousedbops_table` resource
+- Declare every row of a small reference table using the `clickhousedbops_table_contents` resource
 - Manage `views` in a `ClickHouse` instance using the `clickhousedbops_view` resource
 - Manage `materialized views` in a `ClickHouse` instance using the `clickhousedbops_materialized_view` resource
 - Manage `users` in a `ClickHouse` instance using the `clickhousedbops_user` resource

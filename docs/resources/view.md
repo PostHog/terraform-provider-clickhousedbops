@@ -58,7 +58,7 @@ resource "clickhousedbops_view" "team_event_counts" {
 
 ### Required
 
-- `database` (String) Database name that owns the view
+- `database` (String) Database where the object resides
 - `name` (String) View name
 - `query` (String) Raw SELECT query used by the view definition. A change is applied in place with CREATE OR REPLACE VIEW.
 
@@ -69,10 +69,10 @@ resource "clickhousedbops_view" "team_event_counts" {
 
 ### Read-Only
 
-- `create_statement` (String) Canonical CREATE statement reported by ClickHouse
+- `create_statement` (String) The CREATE VIEW statement as returned by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.view or database.view
 - `nodes` (List of String) Hosts where the view exists: every node of the provider's fanout_cluster, or the provider host.
-- `qualified_name` (String) Qualified object name in the form database.view
+- `qualified_name` (String) Qualified name in the form database.view
 
 <a id="nestedatt--columns"></a>
 ### Nested Schema for `columns`

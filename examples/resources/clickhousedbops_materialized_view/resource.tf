@@ -7,7 +7,7 @@ locals {
 }
 
 resource "clickhousedbops_table" "daily_event_counts" {
-  database = "posthog"
+  database = "analytics"
   name     = "daily_event_counts"
   engine   = "MergeTree()"
   order_by = "(team_id, event_date)"
@@ -15,13 +15,13 @@ resource "clickhousedbops_table" "daily_event_counts" {
 }
 
 resource "clickhousedbops_materialized_view" "events_daily_mv" {
-  database   = "posthog"
+  database   = "analytics"
   name       = "events_daily_mv"
   to_table   = clickhousedbops_table.daily_event_counts.qualified_name
   to_columns = local.daily_count_columns
   query      = <<-SQL
     SELECT team_id, toDate(created_at) AS event_date, count() AS event_count
-    FROM posthog.events
+    FROM analytics.events
     GROUP BY team_id, event_date
   SQL
 }

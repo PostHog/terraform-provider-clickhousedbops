@@ -9,10 +9,12 @@ description: |-
   Update behavior is engine-aware:
   MergeTree-family tables are updated in place for supported column changes (including codec and column ttl), indexes, projections, constraints, SAMPLE BY, TTL, append-only ORDER BY extensions that introduce newly-added columns in the same change, and mutable table settings. A changed index, projection or constraint is dropped and added again.Distributed tables are updated in place for column changes, but settings changes still force replacement.Kafka tables are treated as replacement-oriented for schema changes because ClickHouse does not support the necessary ALTER TABLE operations there.Engines without an explicit in-place strategy currently fall back to replacement for schema changes.
   Changes that ClickHouse cannot alter safely in place, such as engine changes, partition_by, primary_key, as_select, unsupported order_by rewrites, readonly table settings, or removing ephemeral_expression from a column, still force replacement.
-  Column changes use ADD COLUMN IF NOT EXISTS and DROP COLUMN IF EXISTS. Every ALTER TABLE runs with alter_sync = 2, so it returns when all replicas have applied it.
+  Column changes use ADD COLUMN IF NOT EXISTS and DROP COLUMN IF EXISTS. Every ALTER TABLE runs with alter_sync = 0, so it never waits for a mutation to rewrite data. The provider then waits until every replica has applied the new metadata, and watches the mutations the ALTER started for a few seconds: one that fails is an error, and one still running is a warning.
+  A change that drops the table, a destroy or a replacement, is refused while a MergeTree-family table holds rows on any node. The plan fails and names the nodes and their row counts. To drop the data on purpose, set force_destroy = true and apply that change on its own first: the value in state counts, so setting it in the same plan as the replacement is refused too.
+  A mutation that keeps failing on the table fails every plan of it, with the KILL MUTATION statement that stops it. Its ALTER already changed the metadata, so without this the table would look up to date while its data is not.
   unmanaged_columns and unmanaged_indexes are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.
   When the provider sets fanout_cluster, the resource acts on every node of that cluster and never uses ON CLUSTER:
-  Create and update make every node hold the configured definition. A missing table is created. An existing table is altered in place from its current definition on that node; when the difference needs a replacement, the apply fails with an error that names the node and the attributes. For a Replicated engine the ALTER runs on the first replica of each shard that has the table, because ClickHouse replicates it; only MODIFY SETTING and RESET SETTING run on every replica, because ClickHouse does not replicate them. A new replica of an existing shard is created with the column and index list that the shard already holds.Read queries every node. The nodes attribute lists the hosts that have the table. When a node is missing the table, or a node joins the cluster later, the plan shows an in-place update of nodes and the apply creates the table there. When one node holds a different definition, the plan shows that difference.Delete drops the table on every node with DROP ... IF EXISTS ... SYNC.cluster_name cannot be set together with fanout_cluster.
+  Create and update make every node hold the configured definition. A missing table is created. An existing table is altered in place from its current definition on that node; when the difference needs a replacement, the apply fails with an error that names the node and the attributes. For a Replicated* engine the ALTER runs on the first replica of each shard that has the table, because ClickHouse replicates it; only MODIFY SETTING and RESET SETTING run on every replica, because ClickHouse does not replicate them. A new replica of an existing shard is created with the column and index list that the shard already holds.Read queries every node. The nodes attribute lists the hosts that have the table. When a node is missing the table, or a node joins the cluster later, the plan shows an in-place update of nodes and the apply creates the table there. When one node holds a different definition, the plan shows that difference.Delete drops the table on every node with DROP ... IF EXISTS ... SYNC.cluster_name cannot be set together with fanout_cluster.
   Creating a table that already exists on a node is an error, unless the provider sets adopt_existing = true. With adoption the existing table is changed in place to match the configuration, or left alone when it already matches.
   SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in SHOW CREATE, because ClickHouse rewrites expressions into its canonical form.
 ---
@@ -34,7 +36,11 @@ Update behavior is engine-aware:
 
 Changes that ClickHouse cannot alter safely in place, such as engine changes, `partition_by`, `primary_key`, `as_select`, unsupported `order_by` rewrites, readonly table settings, or removing `ephemeral_expression` from a column, still force replacement.
 
-Column changes use `ADD COLUMN IF NOT EXISTS` and `DROP COLUMN IF EXISTS`. Every `ALTER TABLE` runs with `alter_sync = 2`, so it returns when all replicas have applied it.
+Column changes use `ADD COLUMN IF NOT EXISTS` and `DROP COLUMN IF EXISTS`. Every `ALTER TABLE` runs with `alter_sync = 0`, so it never waits for a mutation to rewrite data. The provider then waits until every replica has applied the new metadata, and watches the mutations the `ALTER` started for a few seconds: one that fails is an error, and one still running is a warning.
+
+A change that drops the table, a destroy or a replacement, is refused while a MergeTree-family table holds rows on any node. The plan fails and names the nodes and their row counts. To drop the data on purpose, set `force_destroy = true` and apply that change on its own first: the value in state counts, so setting it in the same plan as the replacement is refused too.
+
+A mutation that keeps failing on the table fails every plan of it, with the `KILL MUTATION` statement that stops it. Its `ALTER` already changed the metadata, so without this the table would look up to date while its data is not.
 
 `unmanaged_columns` and `unmanaged_indexes` are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.
 
@@ -84,7 +90,7 @@ resource "clickhousedbops_table" "events" {
 
 ### Required
 
-- `database` (String) Database name that owns the table
+- `database` (String) Database where the object resides
 - `engine` (String) Raw ClickHouse engine expression, for example MergeTree(), Distributed(...), or Kafka(...)
 - `name` (String) Table name
 
@@ -94,6 +100,7 @@ resource "clickhousedbops_table" "events" {
 - `cluster_name` (String) Name of the cluster to create the table into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.
 - `columns` (Attributes List) Structured column definitions. This can be assigned directly from a local list of objects. (see [below for nested schema](#nestedatt--columns))
 - `constraints` (Attributes List) CHECK constraints. They are compared by name, not by position. (see [below for nested schema](#nestedatt--constraints))
+- `force_destroy` (Boolean) Allow dropping or replacing this table while a MergeTree-family engine holds rows on any node. The value in state counts, so set it to true and apply before the change that drops the table.
 - `indexes` (Attributes List) Data skipping indexes. They are compared by name, not by position. (see [below for nested schema](#nestedatt--indexes))
 - `order_by` (String) Raw ORDER BY clause expression
 - `partition_by` (String) Raw PARTITION BY clause expression
@@ -107,10 +114,10 @@ resource "clickhousedbops_table" "events" {
 
 ### Read-Only
 
-- `create_statement` (String) Canonical CREATE statement reported by ClickHouse
+- `create_statement` (String) The CREATE TABLE statement as returned by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.table or database.table
 - `nodes` (List of String) Hosts where the table exists: every node of the provider's fanout_cluster, or the provider host.
-- `qualified_name` (String) Qualified object name in the form database.table
+- `qualified_name` (String) Qualified name in the form database.table
 
 <a id="nestedatt--columns"></a>
 ### Nested Schema for `columns`
@@ -162,4 +169,7 @@ Required:
 
 - `name` (String) Projection name
 - `query` (String) Raw projection query: the text inside PROJECTION name (...)
+
+Optional:
+
 - `settings` (String) Projection settings: the text inside WITH SETTINGS (...)

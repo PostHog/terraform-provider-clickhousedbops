@@ -86,8 +86,12 @@ func NewHTTPClient(config HTTPClientConfig) (ClickhouseClient, error) {
 	}, nil
 }
 
-func (i *httpClient) Select(ctx context.Context, qry string, callback func(Row) error) error {
-	body, err := i.runQuery(ctx, qry, nil)
+func (i *httpClient) Select(ctx context.Context, qry string, callback func(Row) error, params ...map[string]string) error {
+	var queryParams map[string]string
+	if len(params) > 0 {
+		queryParams = params[0]
+	}
+	body, err := i.runQuery(ctx, qry, queryParams)
 	if err != nil {
 		return errors.WithMessage(err, "error running query")
 	}

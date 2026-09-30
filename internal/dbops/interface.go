@@ -19,7 +19,14 @@ type Client interface {
 	CreateTable(ctx context.Context, table Table, clusterName *string) (*Table, error)
 	GetTable(ctx context.Context, database string, name string, clusterName *string) (*Table, error)
 	DeleteTable(ctx context.Context, database string, name string, clusterName *string) error
-	AlterTable(ctx context.Context, database string, name string, clusterName *string, actions []string) error
+	TableRows(ctx context.Context, database string, name string) (uint64, error)
+	FailingMutations(ctx context.Context, database string, name string) ([]FailingMutation, error)
+
+	TableContentsChecksum(ctx context.Context, database string, table string) (string, bool, error)
+	DataChecksum(ctx context.Context, database string, table string, format string, data string) (string, error)
+	ReplaceTableContents(ctx context.Context, database string, table string, format string, data string) error
+	IsReplicated(ctx context.Context, database string, table string) (bool, error)
+	AlterTable(ctx context.Context, database string, name string, clusterName *string, actions []string) ([]RunningMutation, error)
 	GetTableEngineCapabilities(ctx context.Context, engine string) (TableEngineCapabilities, error)
 	GetTableSettingCapabilities(ctx context.Context, engine string, settingNames []string) (map[string]TableSettingCapability, error)
 

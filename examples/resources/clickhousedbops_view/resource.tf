@@ -6,12 +6,12 @@ locals {
 }
 
 resource "clickhousedbops_view" "team_event_counts" {
-  database = "posthog"
+  database = "analytics"
   name     = "team_event_counts"
   columns  = local.view_columns
   query    = <<-SQL
     SELECT team_id, count() AS event_count
-    FROM posthog.events
+    FROM analytics.events
     GROUP BY team_id
   SQL
 }

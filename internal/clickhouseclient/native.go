@@ -77,12 +77,16 @@ func NewNativeClient(config NativeClientConfig) (ClickhouseClient, error) {
 	}, nil
 }
 
-func (i *nativeClient) Select(ctx context.Context, qry string, callback func(Row) error) error {
+func (i *nativeClient) Select(ctx context.Context, qry string, callback func(Row) error, params ...map[string]string) error {
 	ctx, cancel := queryContext(ctx, i.queryTimeout)
 	defer cancel()
 
 	ctx = tflog.SetField(ctx, "Query", loggableQuery(ctx, qry))
 	tflog.Debug(ctx, "Running Query")
+
+	if len(params) > 0 {
+		ctx = clickhouse.Context(ctx, clickhouse.WithParameters(params[0]))
+	}
 
 	rows, err := i.connection.Query(ctx, qry)
 	if err != nil {

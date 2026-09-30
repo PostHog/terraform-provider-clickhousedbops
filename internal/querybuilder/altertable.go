@@ -58,8 +58,9 @@ func BuildAlterTable(database string, name string, clusterName *string, actions 
 		qualifiedIdentifier(database, name),
 	}
 	tokens = appendClusterClause(tokens, clusterName)
-	// alter_sync = 2 makes a replicated ALTER return only when every replica has applied it.
-	tokens = append(tokens, strings.Join(filtered, ", "), "SETTINGS alter_sync = 2")
+	// alter_sync = 0 returns without waiting for the mutation that rewrites data, which can run
+	// for hours. The caller waits for the metadata change itself.
+	tokens = append(tokens, strings.Join(filtered, ", "), "SETTINGS alter_sync = 0")
 
 	return strings.Join(tokens, " ") + ";", nil
 }

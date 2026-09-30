@@ -8,7 +8,7 @@ locals {
 
 resource "clickhousedbops_table" "events_local" {
   cluster_name = "cluster"
-  database     = "posthog"
+  database     = "analytics"
   name         = "events_local"
   engine       = "MergeTree()"
   partition_by = "toYYYYMM(created_at)"
@@ -18,8 +18,8 @@ resource "clickhousedbops_table" "events_local" {
 
 resource "clickhousedbops_table" "events" {
   cluster_name = "cluster"
-  database     = "posthog"
+  database     = "analytics"
   name         = "events"
-  engine       = "Distributed('cluster', 'posthog', '${clickhousedbops_table.events_local.name}', rand())"
+  engine       = "Distributed('cluster', 'analytics', '${clickhousedbops_table.events_local.name}', rand())"
   columns      = local.event_columns
 }

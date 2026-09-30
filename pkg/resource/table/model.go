@@ -24,4 +24,5 @@ type TableResourceModel struct {
 	TTL              types.String `tfsdk:"ttl"`
 	Settings         types.String `tfsdk:"settings"`
 	AsSelect         types.String `tfsdk:"as_select"`
+	ForceDestroy     types.Bool   `tfsdk:"force_destroy"`
 }

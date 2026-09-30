@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -119,6 +120,13 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
+	attrs["force_destroy"] = schema.BoolAttribute{
+		Optional: true,
+		Computed: true,
+		Default:  booldefault.StaticBool(false),
+		Description: "Allow dropping or replacing this table while a MergeTree-family engine holds rows on any node. " +
+			"The value in state counts, so set it to true and apply before the change that drops the table.",
+	}
 	resp.Schema = schema.Schema{
 		Attributes:          attrs,
 		MarkdownDescription: tableResourceDescription,
@@ -134,10 +142,15 @@ func (r *Resource) Configure(_ context.Context, req resource.ConfigureRequest, _
 }
 
 func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.Plan.Raw.IsNull() {
+	if r.client == nil {
 		return
 	}
-	if r.client == nil {
+	if req.Plan.Raw.IsNull() {
+		var state TableResourceModel
+		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+		if !resp.Diagnostics.HasError() {
+			resp.Diagnostics.Append(r.guardDataLoss(ctx, state, "destroy")...)
+		}
 		return
 	}
 
@@ -242,6 +255,12 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	for attr := range updatePlan.ReplaceAttrs {
 		resp.RequiresReplace = append(resp.RequiresReplace, path.Root(attr))
 	}
+	if len(resp.RequiresReplace) > 0 {
+		resp.Diagnostics.Append(r.guardDataLoss(ctx, state, "replace")...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
 
 	// Nothing to run on any node: the create statement stays what it is.
 	var plannedNodes types.List
@@ -320,7 +339,17 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
+	resp.Diagnostics.Append(r.checkMutations(ctx, state.Database.ValueString(), state.Name.ValueString())...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	newState.Nodes = nodes
+	// An imported table, or one from before force_destroy existed, gets the default, so that the
+	// first plan does not show it as a change.
+	if newState.ForceDestroy.IsNull() {
+		newState.ForceDestroy = types.BoolValue(false)
+	}
 	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, table.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
 	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
 }
@@ -348,9 +377,76 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 
+	resp.Diagnostics.Append(r.guardDataLoss(ctx, state, "destroy")...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
 		return client.DeleteTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
 	})...)
+}
+
+// checkMutations fails on a mutation of the table that keeps failing. Its ALTER already changed
+// the metadata, so the table matches the configuration while the data does not, and the
+// mutation blocks merges of the parts it cannot rewrite.
+func (r *Resource) checkMutations(ctx context.Context, database string, name string) diag.Diagnostics {
+	var diags diag.Diagnostics
+	nodes, err := r.client.SchemaNodes(ctx)
+	if err != nil {
+		diags.AddError("Error listing cluster nodes", fmt.Sprintf("%+v\n", err))
+		return diags
+	}
+	for _, node := range nodes {
+		failing, err := node.Client.FailingMutations(ctx, database, name)
+		if err != nil {
+			diags.AddError(fmt.Sprintf("Error reading mutations on node %q", node.Host), fmt.Sprintf("%+v\n", err))
+			return diags
+		}
+		for _, mutation := range failing {
+			diags.AddError(
+				"Failing mutation on "+schemahelpers.QualifiedName(database, name),
+				fmt.Sprintf("Node %q: mutation %s (%s) fails: %s. Fix the cause, or stop it with %s.", node.Host, mutation.ID, mutation.Command, mutation.Reason, mutation.KillHint(database, name)),
+			)
+		}
+	}
+	return diags
+}
+
+// guardDataLoss refuses to drop a MergeTree-family table that holds rows on any node, unless
+// force_destroy is true in state. It runs when the plan is made, so that a pull request shows the
+// refusal, and again before the drop.
+func (r *Resource) guardDataLoss(ctx context.Context, state TableResourceModel, action string) diag.Diagnostics {
+	var diags diag.Diagnostics
+	if state.ForceDestroy.ValueBool() || !strings.HasSuffix(strings.ToLower(tableengine.BaseName(state.Engine.ValueString())), "mergetree") {
+		return diags
+	}
+
+	nodes, err := r.client.SchemaNodes(ctx)
+	if err != nil {
+		diags.AddError("Error listing cluster nodes", fmt.Sprintf("%+v\n", err))
+		return diags
+	}
+	var holding []string
+	for _, node := range nodes {
+		rows, err := node.Client.TableRows(ctx, state.Database.ValueString(), state.Name.ValueString())
+		if err != nil {
+			diags.AddError(fmt.Sprintf("Error reading rows on node %q", node.Host), fmt.Sprintf("%+v\n", err))
+			return diags
+		}
+		if rows > 0 {
+			holding = append(holding, fmt.Sprintf("%s (%d rows)", node.Host, rows))
+		}
+	}
+	if len(holding) > 0 {
+		name := schemahelpers.QualifiedName(state.Database.ValueString(), state.Name.ValueString())
+		diags.AddError(
+			fmt.Sprintf("Refusing to %s %s, which holds data", action, name),
+			fmt.Sprintf("%s holds rows on %s. Dropping it loses them. If that is intended, set force_destroy = true on this table and apply that first; the next plan can then %s it. Otherwise change the configuration so that the table is altered in place.",
+				name, strings.Join(holding, ", "), action),
+		)
+	}
+	return diags
 }
 
 func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
@@ -443,8 +539,15 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 			}
 
 			for _, actionGroup := range updatePlan.ActionGroups {
-				if err := node.Client.AlterTable(ctx, desired.Database, desired.Name, clusterName, actionGroup); err != nil {
+				running, err := node.Client.AlterTable(ctx, desired.Database, desired.Name, clusterName, actionGroup)
+				if err != nil {
 					return err
+				}
+				for _, mutation := range running {
+					diags.AddWarning(
+						"Mutation running on "+schemahelpers.QualifiedName(desired.Database, desired.Name),
+						fmt.Sprintf("Node %q: mutation %s (%s) has %d parts left. It continues in the background; see system.mutations.", node.Host, mutation.ID, mutation.Command, mutation.PartsToDo),
+					)
 				}
 			}
 			return nil

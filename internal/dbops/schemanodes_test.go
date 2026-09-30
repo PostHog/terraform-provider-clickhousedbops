@@ -8,17 +8,17 @@ import (
 )
 
 type clusterRowsClient struct {
-	rows    [][4]any
+	rows    [][5]any
 	queries []string
 }
 
 func (c *clusterRowsClient) Exec(context.Context, string, ...map[string]string) error { return nil }
 
-func (c *clusterRowsClient) Select(_ context.Context, sql string, callback func(clickhouseclient.Row) error) error {
+func (c *clusterRowsClient) Select(_ context.Context, sql string, callback func(clickhouseclient.Row) error, _ ...map[string]string) error {
 	c.queries = append(c.queries, sql)
 	for _, values := range c.rows {
 		row := clickhouseclient.Row{}
-		for i, field := range []string{"host_name", "port", "shard_num", "replica_num"} {
+		for i, field := range []string{"host_name", "host_address", "port", "shard_num", "replica_num"} {
 			row.Set(field, values[i])
 		}
 		if err := callback(row); err != nil {
@@ -40,15 +40,15 @@ func TestSchemaNodes(t *testing.T) {
 	})
 
 	t.Run("fan-out connects to every node in shard and replica order, once", func(t *testing.T) {
-		entry := &clusterRowsClient{rows: [][4]any{
-			{"s2r1", uint64(9000), uint64(2), uint64(1)},
-			{"s1r2", uint64(9001), uint64(1), uint64(2)},
-			{"s1r1", uint64(9000), uint64(1), uint64(1)},
+		entry := &clusterRowsClient{rows: [][5]any{
+			{"s2r1", "10.0.0.21", uint64(9000), uint64(2), uint64(1)},
+			{"s1r2", "10.0.0.12", uint64(9001), uint64(1), uint64(2)},
+			{"s1r1", "10.0.0.11", uint64(9000), uint64(1), uint64(1)},
 		}}
 		var dialed []string
-		client, _ := NewClient(entry, WithHost("entry"), WithAdoptExisting(true), WithFanout("prod", func(host string, port uint16) (clickhouseclient.ClickhouseClient, error) {
-			dialed = append(dialed, host)
-			if host == "s1r2" && port != 9001 {
+		client, _ := NewClient(entry, WithHost("entry"), WithAdoptExisting(true), WithFanout("prod", func(address string, port uint16) (clickhouseclient.ClickhouseClient, error) {
+			dialed = append(dialed, address)
+			if address == "10.0.0.12" && port != 9001 {
 				t.Errorf("expected the port from system.clusters, got %d", port)
 			}
 			return &clusterRowsClient{}, nil
@@ -73,7 +73,10 @@ func TestSchemaNodes(t *testing.T) {
 		if len(dialed) != 3 || len(entry.queries) != 1 {
 			t.Fatalf("expected one discovery and three cached connections, got %d queries and %v", len(entry.queries), dialed)
 		}
-		if want := "SELECT `host_name`, toUInt64(port) AS `port`, toUInt64(shard_num) AS `shard_num`, toUInt64(replica_num) AS `replica_num` FROM `system`.`clusters` WHERE (`cluster` = 'prod');"; entry.queries[0] != want {
+		if dialed[0] != "10.0.0.11" || dialed[1] != "10.0.0.12" || dialed[2] != "10.0.0.21" {
+			t.Errorf("expected connections to the host addresses, got %v", dialed)
+		}
+		if want := "SELECT `host_name`, `host_address`, toUInt64(port) AS `port`, toUInt64(shard_num) AS `shard_num`, toUInt64(replica_num) AS `replica_num` FROM `system`.`clusters` WHERE (`cluster` = 'prod');"; entry.queries[0] != want {
 			t.Errorf("discovery query = %s, want %s", entry.queries[0], want)
 		}
 	})

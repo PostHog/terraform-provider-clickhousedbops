@@ -13,7 +13,7 @@ func NewUnknownConfigClient() ClickhouseClient {
 	return unknownConfigClient{}
 }
 
-func (unknownConfigClient) Select(context.Context, string, func(Row) error) error {
+func (unknownConfigClient) Select(context.Context, string, func(Row) error, ...map[string]string) error {
 	return errConfigUnknown
 }
 

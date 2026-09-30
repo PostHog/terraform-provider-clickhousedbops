@@ -10,7 +10,7 @@ locals {
 }
 
 resource "clickhousedbops_table" "dictionary_source" {
-  database = "posthog"
+  database = "analytics"
   name     = "dictionary_source"
   engine   = "MergeTree()"
   order_by = "id"
@@ -18,11 +18,11 @@ resource "clickhousedbops_table" "dictionary_source" {
 }
 
 resource "clickhousedbops_dictionary" "teams" {
-  database    = "posthog"
+  database    = "analytics"
   name        = "teams"
   attributes  = local.dictionary_attributes
   primary_key = ["id"]
-  source      = "CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'posthog' TABLE 'dictionary_source')"
+  source      = "CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'analytics' TABLE 'dictionary_source')"
   layout      = "FLAT()"
   lifetime    = "0"
 }

@@ -73,7 +73,7 @@ resource "clickhousedbops_dictionary" "teams" {
 ### Required
 
 - `attributes` (Attributes List) Dictionary attributes, including key columns referenced by primary_key. This can be assigned directly from a local list of objects. (see [below for nested schema](#nestedatt--attributes))
-- `database` (String) Database name that owns the dictionary
+- `database` (String) Database where the object resides
 - `layout` (String) Raw LAYOUT clause body, for example FLAT() or HASHED()
 - `lifetime` (String) Raw LIFETIME clause body, for example 0 or MIN 0 MAX 300
 - `name` (String) Dictionary name
@@ -89,10 +89,10 @@ resource "clickhousedbops_dictionary" "teams" {
 
 ### Read-Only
 
-- `create_statement` (String) Canonical CREATE statement reported by ClickHouse
+- `create_statement` (String) The CREATE DICTIONARY statement as returned by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.dictionary or database.dictionary
 - `nodes` (List of String) Hosts where the dictionary exists: every node of the provider's fanout_cluster, or the provider host.
-- `qualified_name` (String) Qualified object name in the form database.dictionary
+- `qualified_name` (String) Qualified name in the form database.dictionary
 
 <a id="nestedatt--attributes"></a>
 ### Nested Schema for `attributes`

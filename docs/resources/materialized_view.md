@@ -72,7 +72,7 @@ resource "clickhousedbops_materialized_view" "events_daily_mv" {
 
 ### Required
 
-- `database` (String) Database name that owns the materialized view
+- `database` (String) Database where the object resides
 - `name` (String) Materialized view name
 - `query` (String) Raw SELECT query used by the materialized view definition. With to_table a change is applied in place with ALTER TABLE ... MODIFY QUERY. With engine a change replaces the materialized view.
 
@@ -81,16 +81,22 @@ resource "clickhousedbops_materialized_view" "events_daily_mv" {
 - `cluster_name` (String) Name of the cluster to create the materialized view into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.
 - `columns` (Attributes List) Optional inline materialized-view columns for engine-backed definitions. (see [below for nested schema](#nestedatt--columns))
 - `engine` (String) Raw ClickHouse engine expression. Set this or to_table, but not both.
+- `order_by` (String) Raw ORDER BY clause expression for engine-backed materialized views
+- `partition_by` (String) Raw PARTITION BY clause expression for engine-backed materialized views
 - `populate` (Boolean) Whether to append POPULATE to the CREATE MATERIALIZED VIEW statement
+- `primary_key` (String) Raw PRIMARY KEY clause expression for engine-backed materialized views
+- `sample_by` (String) Raw SAMPLE BY clause expression for engine-backed materialized views
+- `settings` (String) Raw SETTINGS clause body for engine-backed materialized views
 - `to_columns` (Attributes List) Optional destination signature appended after TO <table> (...). Only name, type, and nullable are supported there. When omitted, the column list that ClickHouse infers is not tracked. (see [below for nested schema](#nestedatt--to_columns))
 - `to_table` (String) Destination table for TO-based materialized views. Usually this references clickhousedbops_table.<name>.qualified_name.
+- `ttl` (String) Raw TTL clause expression for engine-backed materialized views
 
 ### Read-Only
 
-- `create_statement` (String) Canonical CREATE statement reported by ClickHouse
-- `id` (String) Stable identifier in the form cluster:database.materialized_view or database.materialized_view
+- `create_statement` (String) The CREATE MATERIALIZED VIEW statement as returned by ClickHouse
+- `id` (String) Stable identifier in the form cluster:database.materialized view or database.materialized view
 - `nodes` (List of String) Hosts where the materialized view exists: every node of the provider's fanout_cluster, or the provider host.
-- `qualified_name` (String) Qualified object name in the form database.materialized_view
+- `qualified_name` (String) Qualified name in the form database.materialized view
 
 <a id="nestedatt--columns"></a>
 ### Nested Schema for `columns`

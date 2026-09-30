@@ -93,7 +93,7 @@ func Test_alterTable(t *testing.T) {
 		t.Fatalf("BuildAlterTable() error = %v", err)
 	}
 
-	want := "ALTER TABLE `analytics`.`events` ADD COLUMN IF NOT EXISTS `extra` UInt64 COMMENT 'human-readable' AFTER `event`, MODIFY ORDER BY (team_id, extra) SETTINGS alter_sync = 2;"
+	want := "ALTER TABLE `analytics`.`events` ADD COLUMN IF NOT EXISTS `extra` UInt64 COMMENT 'human-readable' AFTER `event`, MODIFY ORDER BY (team_id, extra) SETTINGS alter_sync = 0;"
 	if sql != want {
 		t.Fatalf("BuildAlterTable() got = %v, want %v", sql, want)
 	}

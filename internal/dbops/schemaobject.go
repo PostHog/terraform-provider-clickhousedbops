@@ -191,17 +191,44 @@ func (i *impl) DeleteTable(ctx context.Context, database string, name string, cl
 	return i.deleteIfExists(ctx, table != nil, querybuilder.NewDropTable(database, name).WithCluster(clusterName))
 }
 
-func (i *impl) AlterTable(ctx context.Context, database string, name string, clusterName *string, actions []string) error {
+// TableRows returns the rows the table holds on this node; 0 when it does not exist.
+func (i *impl) TableRows(ctx context.Context, database string, name string) (uint64, error) {
+	sql, err := querybuilder.NewSelect(
+		[]querybuilder.Field{querybuilder.NewRawField("toUInt64(ifNull(total_rows, 0))", "rows")},
+		"system.tables",
+	).Where(querybuilder.WhereEquals("database", database), querybuilder.WhereEquals("name", name)).Build()
+	if err != nil {
+		return 0, errors.WithMessage(err, "error building query")
+	}
+
+	var rows uint64
+	err = i.clickhouseClient.Select(ctx, sql, func(data clickhouseclient.Row) error {
+		rows, err = data.GetUInt64("rows")
+		return err
+	})
+	if err != nil {
+		return 0, errors.WithMessage(err, "error reading the table's row count")
+	}
+	return rows, nil
+}
+
+// AlterTable runs the ALTER without waiting for the mutations it starts, then waits for the
+// metadata change to reach every replica. It returns the mutations that are still running.
+func (i *impl) AlterTable(ctx context.Context, database string, name string, clusterName *string, actions []string) ([]RunningMutation, error) {
 	sql, err := querybuilder.BuildAlterTable(database, name, clusterName, actions)
 	if err != nil {
-		return errors.WithMessage(err, "error building query")
+		return nil, errors.WithMessage(err, "error building query")
 	}
 
+	startedAt, err := i.serverNow(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := i.clickhouseClient.Exec(ctx, sql); err != nil {
-		return errors.WithMessage(err, "error running query")
+		return nil, errors.WithMessage(err, "error running query")
 	}
 
-	return nil
+	return i.waitForAlter(ctx, database, name, startedAt)
 }
 
 func (i *impl) CreateView(ctx context.Context, view View, clusterName *string) (*View, error) {

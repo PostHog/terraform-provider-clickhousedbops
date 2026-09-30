@@ -70,7 +70,7 @@ func (c *scriptedClient) Exec(_ context.Context, sql string, _ ...map[string]str
 	return c.next(sql).err
 }
 
-func (c *scriptedClient) Select(_ context.Context, sql string, callback func(clickhouseclient.Row) error) error {
+func (c *scriptedClient) Select(_ context.Context, sql string, callback func(clickhouseclient.Row) error, _ ...map[string]string) error {
 	s := c.next(sql)
 	if s.err != nil {
 		return s.err

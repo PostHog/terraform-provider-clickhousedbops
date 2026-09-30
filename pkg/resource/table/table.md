@@ -13,7 +13,11 @@ Update behavior is engine-aware:
 
 Changes that ClickHouse cannot alter safely in place, such as engine changes, `partition_by`, `primary_key`, `as_select`, unsupported `order_by` rewrites, readonly table settings, or removing `ephemeral_expression` from a column, still force replacement.
 
-Column changes use `ADD COLUMN IF NOT EXISTS` and `DROP COLUMN IF EXISTS`. Every `ALTER TABLE` runs with `alter_sync = 2`, so it returns when all replicas have applied it.
+Column changes use `ADD COLUMN IF NOT EXISTS` and `DROP COLUMN IF EXISTS`. Every `ALTER TABLE` runs with `alter_sync = 0`, so it never waits for a mutation to rewrite data. The provider then waits until every replica has applied the new metadata, and watches the mutations the `ALTER` started for a few seconds: one that fails is an error, and one still running is a warning.
+
+A change that drops the table, a destroy or a replacement, is refused while a MergeTree-family table holds rows on any node. The plan fails and names the nodes and their row counts. To drop the data on purpose, set `force_destroy = true` and apply that change on its own first: the value in state counts, so setting it in the same plan as the replacement is refused too.
+
+A mutation that keeps failing on the table fails every plan of it, with the `KILL MUTATION` statement that stops it. Its `ALTER` already changed the metadata, so without this the table would look up to date while its data is not.
 
 `unmanaged_columns` and `unmanaged_indexes` are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.
 

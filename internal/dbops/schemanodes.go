@@ -18,9 +18,9 @@ type SchemaNode struct {
 	Client     Client
 }
 
-// NodeClientFactory opens a connection to one cluster node. port is the node's native
-// protocol port as reported by system.clusters.
-type NodeClientFactory func(host string, port uint16) (clickhouseclient.ClickhouseClient, error)
+// NodeClientFactory opens a connection to one cluster node. address is the IP address and port
+// the node's native protocol port, both as reported by system.clusters.
+type NodeClientFactory func(address string, port uint16) (clickhouseclient.ClickhouseClient, error)
 
 func (i *impl) FanoutCluster() string {
 	return i.fanoutCluster
@@ -48,6 +48,7 @@ func (i *impl) SchemaNodes(ctx context.Context) ([]SchemaNode, error) {
 	sql, err := querybuilder.NewSelect(
 		[]querybuilder.Field{
 			querybuilder.NewField("host_name"),
+			querybuilder.NewField("host_address"),
 			querybuilder.NewRawField("toUInt64(port)", "port"),
 			querybuilder.NewRawField("toUInt64(shard_num)", "shard_num"),
 			querybuilder.NewRawField("toUInt64(replica_num)", "replica_num"),
@@ -60,13 +61,17 @@ func (i *impl) SchemaNodes(ctx context.Context) ([]SchemaNode, error) {
 
 	type discoveredNode struct {
 		SchemaNode
-		port uint64
+		address string
+		port    uint64
 	}
 	discovered := make([]discoveredNode, 0)
 	err = i.clickhouseClient.Select(ctx, sql, func(data clickhouseclient.Row) error {
 		node := discoveredNode{}
 		var rowErr error
 		if node.Host, rowErr = data.GetString("host_name"); rowErr != nil {
+			return rowErr
+		}
+		if node.address, rowErr = data.GetString("host_address"); rowErr != nil {
 			return rowErr
 		}
 		if node.port, rowErr = data.GetUInt64("port"); rowErr != nil {
@@ -97,7 +102,12 @@ func (i *impl) SchemaNodes(ctx context.Context) ([]SchemaNode, error) {
 
 	nodes := make([]SchemaNode, 0, len(discovered))
 	for _, node := range discovered {
-		clickhouseClient, err := i.nodeFactory(node.Host, uint16(node.port)) //nolint:gosec
+		// The server resolves host_name to host_address when it loads the cluster, so connecting
+		// to the address does not depend on the caller resolving the node's name.
+		if node.address == "" {
+			return nil, errors.Errorf("node %q of fanout_cluster %q has no host_address in system.clusters: the server could not resolve it", node.Host, i.fanoutCluster)
+		}
+		clickhouseClient, err := i.nodeFactory(node.address, uint16(node.port)) //nolint:gosec
 		if err != nil {
 			return nil, errors.WithMessage(err, "error connecting to node "+node.Host)
 		}
