@@ -5,19 +5,18 @@ import (
 )
 
 func Test_selectQueryBuilder_Build(t *testing.T) {
-	orderBy := NewField("col1")
-	orderDirection := ASC
-
 	tests := []struct {
-		name     string
-		fields   []Field
-		where    []Where
-		from     string
-		cluster  string
-		orderCol *Field
-		orderDir *OrderDirection
-		want     string
-		wantErr  bool
+		name            string
+		fields          []Field
+		where           []Where
+		from            string
+		cluster         string
+		orderCol        *Field
+		orderDir        *OrderDirection
+		arrayJoinColumn string
+		arrayJoinAlias  string
+		want            string
+		wantErr         bool
 	}{
 		{
 			name:    "Select one with",
@@ -68,11 +67,38 @@ func Test_selectQueryBuilder_Build(t *testing.T) {
 			name:     "Select with order by",
 			fields:   []Field{NewField("name")},
 			where:    []Where{whereMock{"mock_where_clause"}},
-			orderCol: &orderBy,
-			orderDir: &orderDirection,
+			orderCol: new(NewField("col1")),
+			orderDir: new(ASC),
 			from:     "users",
 			want:     "SELECT `name` FROM `users` WHERE (mock_where_clause) ORDER BY `col1` ASC;",
 			wantErr:  false,
+		},
+		{
+			name:            "Select with left array join",
+			fields:          []Field{NewField("name"), NewRawField("kv.1", "key_name")},
+			from:            "system.named_collections",
+			arrayJoinColumn: "collection",
+			arrayJoinAlias:  "kv",
+			want:            "SELECT `name`, kv.1 AS `key_name` FROM `system`.`named_collections` LEFT ARRAY JOIN `collection` AS `kv`;",
+			wantErr:         false,
+		},
+		{
+			name:            "Select with left array join on cluster",
+			fields:          []Field{NewRawField("kv.2", "key_value")},
+			from:            "system.named_collections",
+			cluster:         "cluster1",
+			arrayJoinColumn: "collection",
+			arrayJoinAlias:  "kv",
+			want:            "SELECT kv.2 AS `key_value` FROM cluster('cluster1', `system`.`named_collections`) LEFT ARRAY JOIN `collection` AS `kv`;",
+			wantErr:         false,
+		},
+		{
+			name:            "Fail left array join without alias",
+			fields:          []Field{NewField("name")},
+			from:            "system.named_collections",
+			arrayJoinColumn: "collection",
+			want:            "",
+			wantErr:         true,
 		},
 	}
 	for _, tt := range tests {
@@ -86,6 +112,9 @@ func Test_selectQueryBuilder_Build(t *testing.T) {
 			}
 			if tt.orderCol != nil && tt.orderDir != nil {
 				q = q.OrderBy(*tt.orderCol, *tt.orderDir)
+			}
+			if tt.arrayJoinColumn != "" {
+				q = q.LeftArrayJoin(tt.arrayJoinColumn, tt.arrayJoinAlias)
 			}
 			got, err := q.Build()
 			if (err != nil) != tt.wantErr {

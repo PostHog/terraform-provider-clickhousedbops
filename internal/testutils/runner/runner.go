@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
@@ -19,16 +22,42 @@ import (
 )
 
 type TestCase struct {
-	Name            string
-	ChEnv           map[string]string
-	Protocol        string
-	ClusterName     *string
-	Resource        string
-	ResourceName    string
-	ResourceAddress string
+	Name                  string
+	ChEnv                 map[string]string
+	Protocol              string
+	ClusterName           *string
+	Resource              string
+	UpdateResource        *string
+	UpdateExpectNoReplace bool
+	UpdateExpectReplace   bool
+	ResourceName          string
+	ResourceAddress       string
 
+	ExpectError         *regexp.Regexp
 	CheckNotExistsFunc  func(ctx context.Context, dbopsClient dbops.Client, clusterName *string, attrs map[string]string) (bool, error)
 	CheckAttributesFunc func(ctx context.Context, dbopsClient dbops.Client, clusterName *string, attrs map[string]interface{}) error
+
+	// SetupFunc runs after ClickHouse is up and before terraform, to seed out-of-band state.
+	SetupFunc func(ctx context.Context, dbopsClient dbops.Client, clusterName *string) error
+}
+
+// Compose 'up -d' returns before the socat proxies accept connections, so poll until the server is reachable.
+func waitForClickhouse(ctx context.Context, dbopsClient dbops.Client) error {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	for {
+		_, err := dbopsClient.FindUserByName(ctx, "default", nil)
+		if err == nil {
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return fmt.Errorf("timed out waiting for clickhouse to be reachable: %w", err)
+		}
+
+		time.Sleep(2 * time.Second)
+	}
 }
 
 func RunTests(t *testing.T, tests []TestCase) {
@@ -68,10 +97,64 @@ func RunTests(t *testing.T, tests []TestCase) {
 				t.Fatal(err)
 			}
 
+			if tc.SetupFunc != nil {
+				if err := waitForClickhouse(ctx, dbopsClient); err != nil {
+					t.Fatal(err)
+				}
+				if err := tc.SetupFunc(ctx, dbopsClient, tc.ClusterName); err != nil {
+					t.Fatal(err)
+				}
+			}
+
 			t.Run(tc.Name, func(t *testing.T) {
+				// Build test steps: create + optional update
+				steps := []resource.TestStep{
+					{
+						// Combine the provider definition and the resourcePtr definition.
+						Config: fmt.Sprintf("%s\n%s", providerCfg, tc.Resource),
+						ConfigStateChecks: []statecheck.StateCheck{
+							// Compare the state with the actual resource.
+							internalstatecheck.NewGetAttributes(tc.ResourceAddress, func(attrs map[string]interface{}) error {
+								return tc.CheckAttributesFunc(ctx, dbopsClient, tc.ClusterName, attrs)
+							}),
+						},
+						ExpectError: tc.ExpectError,
+					},
+				}
+
+				// Add update step if UpdateResource is provided
+				if tc.UpdateResource != nil {
+					updateStep := resource.TestStep{
+						Config: fmt.Sprintf("%s\n%s", providerCfg, *tc.UpdateResource),
+						ConfigStateChecks: []statecheck.StateCheck{
+							internalstatecheck.NewGetAttributes(tc.ResourceAddress, func(attrs map[string]interface{}) error {
+								return tc.CheckAttributesFunc(ctx, dbopsClient, tc.ClusterName, attrs)
+							}),
+						},
+					}
+					var expectedAction plancheck.ResourceActionType
+					switch {
+					case tc.UpdateExpectNoReplace:
+						expectedAction = plancheck.ResourceActionUpdate
+					case tc.UpdateExpectReplace:
+						expectedAction = plancheck.ResourceActionReplace
+					}
+					if expectedAction != "" {
+						updateStep.ConfigPlanChecks = resource.ConfigPlanChecks{
+							PreApply: []plancheck.PlanCheck{
+								plancheck.ExpectResourceAction(tc.ResourceAddress, expectedAction),
+							},
+						}
+					}
+					steps = append(steps, updateStep)
+				}
+
 				resource.Test(t, resource.TestCase{
 					ProtoV6ProviderFactories: factories.ProviderFactories(),
 					CheckDestroy: func(s *terraform.State) error {
+						if tc.ExpectError != nil {
+							return nil
+						}
 						for address, r := range s.RootModule().Resources {
 							if tc.ResourceAddress == address {
 								exists, err := tc.CheckNotExistsFunc(ctx, dbopsClient, tc.ClusterName, r.Primary.Attributes)
@@ -89,18 +172,7 @@ func RunTests(t *testing.T, tests []TestCase) {
 
 						return fmt.Errorf("root module has no resource %q", tc.ResourceAddress)
 					},
-					Steps: []resource.TestStep{
-						{
-							// Combine the provider definition and the resourcePtr definition.
-							Config: fmt.Sprintf("%s\n%s", providerCfg, tc.Resource),
-							ConfigStateChecks: []statecheck.StateCheck{
-								// Compare the state with the actual resource.
-								internalstatecheck.NewGetAttributes(tc.ResourceAddress, func(attrs map[string]interface{}) error {
-									return tc.CheckAttributesFunc(ctx, dbopsClient, tc.ClusterName, attrs)
-								}),
-							},
-						},
-					},
+					Steps: steps,
 				})
 			})
 		}()

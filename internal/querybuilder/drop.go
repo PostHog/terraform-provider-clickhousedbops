@@ -14,11 +14,13 @@ const (
 	resourceTypeUser            = "USER"
 	resourceTypeView            = "VIEW"
 	resourceTypeSettingsProfile = "SETTINGS PROFILE"
+	resourceTypeNamedCollection = "NAMED COLLECTION"
 )
 
 type DropQueryBuilder interface {
 	QueryBuilder
 	WithCluster(clusterName *string) DropQueryBuilder
+	IfExists(ifExists bool) DropQueryBuilder
 }
 
 type dropQueryBuilder struct {
@@ -26,6 +28,7 @@ type dropQueryBuilder struct {
 	resourceName     string
 	resourceNameSQL  string
 	clusterName      *string
+	ifExists         bool
 }
 
 func NewDropRole(resourceName string) DropQueryBuilder {
@@ -60,8 +63,17 @@ func NewDropSettingsProfile(resourceName string) DropQueryBuilder {
 	return newDrop(resourceTypeSettingsProfile, resourceName)
 }
 
+func NewDropNamedCollection(resourceName string) DropQueryBuilder {
+	return newDrop(resourceTypeNamedCollection, resourceName)
+}
+
 func (q *dropQueryBuilder) WithCluster(clusterName *string) DropQueryBuilder {
 	q.clusterName = clusterName
+	return q
+}
+
+func (q *dropQueryBuilder) IfExists(ifExists bool) DropQueryBuilder {
+	q.ifExists = ifExists
 	return q
 }
 
@@ -100,8 +112,13 @@ func (q *dropQueryBuilder) Build() (string, error) {
 	tokens := []string{
 		"DROP",
 		q.resourceTypeName,
-		resourceNameSQL,
 	}
+
+	if q.ifExists {
+		tokens = append(tokens, "IF", "EXISTS")
+	}
+
+	tokens = append(tokens, resourceNameSQL)
 	tokens = appendClusterClause(tokens, q.clusterName)
 
 	return strings.Join(tokens, " ") + ";", nil

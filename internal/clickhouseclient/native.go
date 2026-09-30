@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -16,7 +17,8 @@ import (
 const defaultDatabase = "default"
 
 type nativeClient struct {
-	connection driver.Conn
+	connection   driver.Conn
+	queryTimeout time.Duration
 }
 
 type NativeClientConfig struct {
@@ -24,6 +26,8 @@ type NativeClientConfig struct {
 	Port             uint16
 	UserPasswordAuth *UserPasswordAuth
 	TLSConfig        *tls.Config
+	DialTimeout      time.Duration
+	QueryTimeout     time.Duration
 }
 
 func NewNativeClient(config NativeClientConfig) (ClickhouseClient, error) {
@@ -39,6 +43,10 @@ func NewNativeClient(config NativeClientConfig) (ClickhouseClient, error) {
 
 	options := clickhouse.Options{
 		Addr: []string{fmt.Sprintf("%s:%d", config.Host, config.Port)},
+	}
+
+	if config.DialTimeout > 0 {
+		options.DialTimeout = config.DialTimeout
 	}
 
 	if config.UserPasswordAuth != nil {
@@ -64,12 +72,16 @@ func NewNativeClient(config NativeClientConfig) (ClickhouseClient, error) {
 	}
 
 	return &nativeClient{
-		connection: conn,
+		connection:   conn,
+		queryTimeout: config.QueryTimeout,
 	}, nil
 }
 
 func (i *nativeClient) Select(ctx context.Context, qry string, callback func(Row) error) error {
-	ctx = tflog.SetField(ctx, "Query", qry)
+	ctx, cancel := queryContext(ctx, i.queryTimeout)
+	defer cancel()
+
+	ctx = tflog.SetField(ctx, "Query", loggableQuery(ctx, qry))
 	tflog.Debug(ctx, "Running Query")
 
 	rows, err := i.connection.Query(ctx, qry)
@@ -86,6 +98,10 @@ func (i *nativeClient) Select(ctx context.Context, qry string, callback func(Row
 
 	// Scan each row of the result.
 	for i := 0; rows.Next(); i++ {
+		if err := rows.Err(); err != nil {
+			return errors.WithMessage(rows.Err(), "error iterating over rows")
+		}
+
 		// Read the columns using the dynamically created variables.
 		if err := rows.Scan(vars...); err != nil {
 			return errors.WithMessage(err, "error scanning row")
@@ -121,9 +137,16 @@ func (i *nativeClient) Select(ctx context.Context, qry string, callback func(Row
 	return nil
 }
 
-func (i *nativeClient) Exec(ctx context.Context, qry string) error {
-	ctx = tflog.SetField(ctx, "Query", qry)
+func (i *nativeClient) Exec(ctx context.Context, qry string, params ...map[string]string) error {
+	ctx, cancel := queryContext(ctx, i.queryTimeout)
+	defer cancel()
+
+	ctx = tflog.SetField(ctx, "Query", loggableQuery(ctx, qry))
 	tflog.Debug(ctx, "Running Query")
+
+	if len(params) > 0 {
+		ctx = clickhouse.Context(ctx, clickhouse.WithParameters(params[0]))
+	}
 
 	err := i.connection.Exec(ctx, qry)
 	if err != nil {

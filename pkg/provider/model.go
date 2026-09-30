@@ -12,6 +12,8 @@ type Model struct {
 	AuthConfig            AuthConfig   `tfsdk:"auth_config"`
 	TLSConfig             *TLSConfig   `tfsdk:"tls_config"`
 	ReadAfterWriteTimeout types.Int64  `tfsdk:"read_after_write_timeout"`
+	DialTimeout           types.Int64  `tfsdk:"dial_timeout"`
+	QueryTimeout          types.Int64  `tfsdk:"query_timeout"`
 }
 
 type AuthConfig struct {
@@ -23,4 +25,5 @@ type AuthConfig struct {
 type TLSConfig struct {
 	InsecureSkipVerify types.Bool   `tfsdk:"insecure_skip_verify"`
 	CACert             types.String `tfsdk:"ca_cert"`
+	ServerName         types.String `tfsdk:"server_name"`
 }

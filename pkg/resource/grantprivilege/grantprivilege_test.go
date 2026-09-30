@@ -2,19 +2,16 @@ package grantprivilege_test
 
 import (
 	"context"
-	_ "embed"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/grants"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/testutils/nilcompare"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/testutils/resourcebuilder"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/testutils/runner"
-	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/grantprivilege"
 )
-
-//go:embed grants.tsv
-var testGrantsTSV string
 
 const (
 	resourceType = "clickhousedbops_grant_privilege"
@@ -27,7 +24,7 @@ const (
 func TestGrantprivilege_acceptance(t *testing.T) {
 	clusterName := "cluster1"
 
-	grantsGroups := grantprivilege.ParseGrantsTSV(testGrantsTSV).Groups
+	grantsGroups := grants.Parsed().Groups
 
 	granteeRoleResource := resourcebuilder.
 		New("clickhousedbops_role", granteeRoleName).
@@ -53,20 +50,23 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 
 		var database *string
 		if attrs["database_name"] != "" {
-			s := attrs["database_name"]
-			database = &s
+			database = new(attrs["database_name"])
 		}
 
 		var table *string
 		if attrs["table_name"] != "" {
-			s := attrs["table_name"]
-			table = &s
+			table = new(attrs["table_name"])
 		}
 
 		var column *string
 		if attrs["column_name"] != "" {
-			s := attrs["column_name"]
-			column = &s
+			column = new(attrs["column_name"])
+		}
+
+		var accessObject *string
+		if attrs["access_object"] != "" {
+			s := attrs["access_object"]
+			accessObject = &s
 		}
 
 		var granteeUserName, granteeRoleName *string
@@ -79,10 +79,11 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 
 		grantPrivilege := dbops.GrantPrivilege{
 			AccessType:          accessType,
-			ExpandedAccessTypes: grantprivilege.AllDescendants(grantsGroups, accessType),
+			ExpandedAccessTypes: grants.AllDescendants(grantsGroups, accessType),
 			DatabaseName:        database,
 			TableName:           table,
 			ColumnName:          column,
+			AccessObject:        accessObject,
 			GranteeUserName:     granteeUserName,
 			GranteeRoleName:     granteeRoleName,
 		}
@@ -99,31 +100,32 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 
 		var database *string
 		if attrs["database_name"] != nil {
-			s := attrs["database_name"].(string)
-			database = &s
+			database = new(attrs["database_name"].(string))
 		}
 
 		var table *string
 		if attrs["table_name"] != nil {
-			s := attrs["table_name"].(string)
-			table = &s
+			table = new(attrs["table_name"].(string))
 		}
 
 		var column *string
 		if attrs["column_name"] != nil {
-			s := attrs["column_name"].(string)
-			column = &s
+			column = new(attrs["column_name"].(string))
+		}
+
+		var accessObject *string
+		if attrs["access_object"] != nil {
+			s := attrs["access_object"].(string)
+			accessObject = &s
 		}
 
 		var granteeUserName, granteeRoleName *string
 		if attrs["grantee_user_name"] != nil {
-			s := attrs["grantee_user_name"].(string)
-			granteeUserName = &s
+			granteeUserName = new(attrs["grantee_user_name"].(string))
 		}
 
 		if attrs["grantee_role_name"] != nil {
-			s := attrs["grantee_role_name"].(string)
-			granteeRoleName = &s
+			granteeRoleName = new(attrs["grantee_role_name"].(string))
 		}
 
 		if granteeUserName == nil && granteeRoleName == nil {
@@ -138,10 +140,11 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 
 		grantPrivilege := dbops.GrantPrivilege{
 			AccessType:          accessType,
-			ExpandedAccessTypes: grantprivilege.AllDescendants(grantsGroups, accessType),
+			ExpandedAccessTypes: grants.AllDescendants(grantsGroups, accessType),
 			DatabaseName:        database,
 			TableName:           table,
 			ColumnName:          column,
+			AccessObject:        accessObject,
 			GranteeUserName:     granteeUserName,
 			GranteeRoleName:     granteeRoleName,
 			GrantOption:         grantOption,
@@ -170,6 +173,10 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 
 		if !nilcompare.NilCompare(grantprivilege.ColumnName, attrs["column_name"]) {
 			return fmt.Errorf("wrong value for column attribute")
+		}
+
+		if !nilcompare.NilCompare(grantprivilege.AccessObject, attrs["access_object"]) {
+			return fmt.Errorf("wrong value for access_object attribute")
 		}
 
 		if !nilcompare.NilCompare(clusterName, attrs["cluster_name"]) {
@@ -240,6 +247,48 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 			CheckAttributesFunc: checkAttributesFunc,
 		},
 		{
+			Name:     "Grant COLUMN-scoped privilege on all databases (null database_name) to user using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithStringAttribute("privilege_name", "SELECT").
+				WithResourceFieldReference("grantee_user_name", "clickhousedbops_user", granteeUserName, "name").
+				AddDependency(granteeUserResource.Build()).
+				Build(),
+			ResourceName:        resourceName,
+			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
+			CheckNotExistsFunc:  checkNotExistsFunc,
+			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
+			Name:     "Grant VIEW-scoped privilege on all databases (null database_name) to role using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithStringAttribute("privilege_name", "CREATE VIEW").
+				WithResourceFieldReference("grantee_role_name", "clickhousedbops_role", granteeRoleName, "name").
+				AddDependency(granteeRoleResource.Build()).
+				Build(),
+			ResourceName:        resourceName,
+			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
+			CheckNotExistsFunc:  checkNotExistsFunc,
+			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
+			Name:     "Grant DICTIONARY-scoped privilege on all databases (null database_name) to role using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithStringAttribute("privilege_name", "CREATE DICTIONARY").
+				WithResourceFieldReference("grantee_role_name", "clickhousedbops_role", granteeRoleName, "name").
+				AddDependency(granteeRoleResource.Build()).
+				Build(),
+			ResourceName:        resourceName,
+			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
+			CheckNotExistsFunc:  checkNotExistsFunc,
+			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
 			Name:     "Grant global parent privilege ACCESS MANAGEMENT to role using Native protocol on a single replica",
 			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
 			Protocol: "native",
@@ -276,6 +325,51 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 			Resource: resourcebuilder.New(resourceType, resourceName).
 				WithStringAttribute("privilege_name", "SELECT").
 				WithStringAttribute("database_name", "test_prefix_*").
+				WithResourceFieldReference("grantee_role_name", "clickhousedbops_role", granteeRoleName, "name").
+				AddDependency(granteeRoleResource.Build()).
+				Build(),
+			ResourceName:        resourceName,
+			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
+			CheckNotExistsFunc:  checkNotExistsFunc,
+			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
+			Name:     "Grant source privilege to user using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithStringAttribute("privilege_name", "S3").
+				WithResourceFieldReference("grantee_user_name", "clickhousedbops_user", granteeUserName, "name").
+				WithBoolAttribute("grant_option", true).
+				AddDependency(granteeUserResource.Build()).
+				Build(),
+			ResourceName:        resourceName,
+			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
+			CheckNotExistsFunc:  checkNotExistsFunc,
+			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
+			Name:     "Grant USER_NAME-scoped privilege on access object to role using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithStringAttribute("privilege_name", "CREATE USER").
+				WithStringAttribute("access_object", "bob").
+				WithResourceFieldReference("grantee_role_name", "clickhousedbops_role", granteeRoleName, "name").
+				AddDependency(granteeRoleResource.Build()).
+				Build(),
+			ResourceName:        resourceName,
+			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
+			CheckNotExistsFunc:  checkNotExistsFunc,
+			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
+			Name:     "Grant SOURCE-scoped READ on access object to role using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithStringAttribute("privilege_name", "READ").
+				WithStringAttribute("access_object", "S3").
 				WithResourceFieldReference("grantee_role_name", "clickhousedbops_role", granteeRoleName, "name").
 				AddDependency(granteeRoleResource.Build()).
 				Build(),
@@ -537,6 +631,27 @@ func TestGrantprivilege_acceptance(t *testing.T) {
 			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
 			CheckNotExistsFunc:  checkNotExistsFunc,
 			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
+			Name:     "Grant privilege to a role fails when a user with the same name exists using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithStringAttribute("privilege_name", "SELECT").
+				WithStringAttribute("database_name", "default").
+				WithResourceFieldReference("grantee_role_name", "clickhousedbops_role", "shadowedrole", "name").
+				AddDependency(resourcebuilder.New("clickhousedbops_role", "shadowedrole").
+					WithResourceFieldReference("name", "clickhousedbops_user", "shadowuser", "name").
+					AddDependency(resourcebuilder.New("clickhousedbops_user", "shadowuser").
+						WithStringAttribute("name", "shadowed").
+						WithFunction("password_sha256_hash_wo", "sha256", "test").
+						WithIntAttribute("password_sha256_hash_wo_version", 1).
+						Build()).
+					Build()).
+				Build(),
+			ResourceName:    resourceName,
+			ResourceAddress: fmt.Sprintf("%s.%s", resourceType, resourceName),
+			ExpectError:     regexp.MustCompile(`(?s)a\s+user\s+with\s+the\s+same\s+name\s+exists`),
 		},
 	}
 

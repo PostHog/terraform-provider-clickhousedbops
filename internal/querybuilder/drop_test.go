@@ -116,6 +116,26 @@ func Test_drop(t *testing.T) {
 			builder: NewDropView("db1", ""),
 			wantErr: true,
 		},
+		{
+			name:    "Drop named collection",
+			builder: NewDropNamedCollection("collection1"),
+			want:    "DROP NAMED COLLECTION `collection1`;",
+		},
+		{
+			name:    "Drop named collection on cluster",
+			builder: NewDropNamedCollection("collection1").WithCluster(&cluster),
+			want:    "DROP NAMED COLLECTION `collection1` ON CLUSTER 'cluster1';",
+		},
+		{
+			name:    "Drop named collection if exists",
+			builder: NewDropNamedCollection("collection1").IfExists(true),
+			want:    "DROP NAMED COLLECTION IF EXISTS `collection1`;",
+		},
+		{
+			name:    "Drop named collection if exists on cluster",
+			builder: NewDropNamedCollection("collection1").IfExists(true).WithCluster(&cluster),
+			want:    "DROP NAMED COLLECTION IF EXISTS `collection1` ON CLUSTER 'cluster1';",
+		},
 	}
 
 	for _, tt := range tests {

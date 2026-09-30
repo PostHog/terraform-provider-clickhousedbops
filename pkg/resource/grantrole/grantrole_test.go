@@ -3,6 +3,7 @@ package grantrole_test
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
@@ -66,13 +67,11 @@ func TestGrantRole_acceptance(t *testing.T) {
 
 		var granteeUserName, granteeRoleName *string
 		if attrs["grantee_user_name"] != nil {
-			s := attrs["grantee_user_name"].(string)
-			granteeUserName = &s
+			granteeUserName = new(attrs["grantee_user_name"].(string))
 		}
 
 		if attrs["grantee_role_name"] != nil {
-			s := attrs["grantee_role_name"].(string)
-			granteeRoleName = &s
+			granteeRoleName = new(attrs["grantee_role_name"].(string))
 		}
 
 		if granteeUserName == nil && granteeRoleName == nil {
@@ -405,6 +404,29 @@ func TestGrantRole_acceptance(t *testing.T) {
 			ResourceAddress:     fmt.Sprintf("%s.%s", resourceType, resourceName),
 			CheckNotExistsFunc:  checkNotExistsFunc,
 			CheckAttributesFunc: checkAttributesFunc,
+		},
+		{
+			Name:     "Grant role to a role fails when a user with the same name exists using Native protocol on a single replica",
+			ChEnv:    map[string]string{"CONFIGFILE": "config-single.xml"},
+			Protocol: "native",
+			Resource: resourcebuilder.New(resourceType, resourceName).
+				WithResourceFieldReference("role_name", "clickhousedbops_role", "grantedrole", "name").
+				WithResourceFieldReference("grantee_role_name", "clickhousedbops_role", "shadowedrole", "name").
+				AddDependency(resourcebuilder.New("clickhousedbops_role", "grantedrole").
+					WithStringAttribute("name", "grantedrole").
+					Build()).
+				AddDependency(resourcebuilder.New("clickhousedbops_role", "shadowedrole").
+					WithResourceFieldReference("name", "clickhousedbops_user", "shadowuser", "name").
+					AddDependency(resourcebuilder.New("clickhousedbops_user", "shadowuser").
+						WithStringAttribute("name", "shadowed").
+						WithFunction("password_sha256_hash_wo", "sha256", "test").
+						WithIntAttribute("password_sha256_hash_wo_version", 1).
+						Build()).
+					Build()).
+				Build(),
+			ResourceName:    resourceName,
+			ResourceAddress: fmt.Sprintf("%s.%s", resourceType, resourceName),
+			ExpectError:     regexp.MustCompile(`(?s)a\s+user\s+with\s+the\s+same\s+name\s+exists`),
 		},
 	}
 

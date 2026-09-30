@@ -82,6 +82,17 @@ func buildDefinitions[T any](items []T, builder func(T) (string, error)) ([]stri
 	return results, nil
 }
 
+// granteeClause renders a TO clause target: ALL EXCEPT a list, ALL, or an explicit grantee list; empty when nothing is set.
+func granteeClause(names []string, all bool, allExcept []string) string {
+	if len(allExcept) > 0 {
+		return "ALL EXCEPT " + strings.Join(backtickAll(allExcept), ", ")
+	}
+	if all {
+		return "ALL"
+	}
+	return strings.Join(backtickAll(names), ", ")
+}
+
 // identifierOrPattern returns a token suitable for use as a database/table identifier
 // in GRANT/REVOKE ON clauses.
 //

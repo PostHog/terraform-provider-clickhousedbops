@@ -48,8 +48,14 @@ type Client interface {
 
 	GrantPrivilege(ctx context.Context, grantPrivilege GrantPrivilege, clusterName *string) (*GrantPrivilege, error)
 	GetGrantPrivilege(ctx context.Context, grantPrivilege *GrantPrivilege, clusterName *string) (*GrantPrivilege, error)
-	RevokeGrantPrivilege(ctx context.Context, accessType string, database *string, table *string, column *string, granteeUserName *string, granteeRoleName *string, clusterName *string) error
+	RevokeGrantPrivilege(ctx context.Context, grantPrivilege GrantPrivilege, clusterName *string) error
 	GetAllGrantsForGrantee(ctx context.Context, granteeUsername *string, granteeRoleName *string, clusterName *string) ([]GrantPrivilege, error)
+
+	CreateRowPolicy(ctx context.Context, rp RowPolicy, clusterName *string) (*RowPolicy, error)
+	GetRowPolicy(ctx context.Context, rp *RowPolicy, clusterName *string) (*RowPolicy, error)
+	GetRowPolicyByID(ctx context.Context, id string, clusterName *string) (*RowPolicy, error)
+	UpdateRowPolicy(ctx context.Context, rp RowPolicy, clusterName *string) (*RowPolicy, error)
+	DeleteRowPolicy(ctx context.Context, id string, clusterName *string) error
 
 	CreateSettingsProfile(ctx context.Context, profile SettingsProfile, clusterName *string) (*SettingsProfile, error)
 	GetSettingsProfile(ctx context.Context, id string, clusterName *string) (*SettingsProfile, error)
@@ -59,10 +65,23 @@ type Client interface {
 	AssociateSettingsProfile(ctx context.Context, id string, roleId *string, userId *string, clusterName *string) error
 	DisassociateSettingsProfile(ctx context.Context, id string, roleId *string, userId *string, clusterName *string) error
 
+	CreateMaskingPolicy(ctx context.Context, maskingPolicy MaskingPolicy) (*MaskingPolicy, error)
+	GetMaskingPolicy(ctx context.Context, maskingPolicy *MaskingPolicy) (*MaskingPolicy, error)
+	GetMaskingPolicyByID(ctx context.Context, id string) (*MaskingPolicy, error)
+	UpdateMaskingPolicy(ctx context.Context, maskingPolicy MaskingPolicy) (*MaskingPolicy, error)
+	DeleteMaskingPolicy(ctx context.Context, id string) error
+
+	CreateNamedCollection(ctx context.Context, collection NamedCollection, clusterName *string) (*NamedCollection, error)
+	GetNamedCollection(ctx context.Context, name string, clusterName *string) (*NamedCollection, error)
+	UpdateNamedCollection(ctx context.Context, collection NamedCollection, deleteKeys []string, clusterName *string) error
+	DeleteNamedCollection(ctx context.Context, name string, clusterName *string) error
+
 	CreateSetting(ctx context.Context, settingsProfileID string, setting Setting, clusterName *string, timeout time.Duration) (*Setting, error)
 	GetSetting(ctx context.Context, settingsProfileID string, name string, clusterName *string) (*Setting, error)
 	DeleteSetting(ctx context.Context, settingsProfileID string, name string, clusterName *string) error
 
 	IsReplicatedStorage(ctx context.Context) (bool, error)
+	IsNamedCollectionsStorageReplicated(ctx context.Context) (bool, error)
 	GetCapabilityFlags(ctx context.Context) (CapabilityFlags, error)
+	NormalizeExpression(ctx context.Context, expression string) (string, error)
 }

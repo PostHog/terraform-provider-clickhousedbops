@@ -56,7 +56,7 @@ generate:
 
 TFPLUGINDOCS = /tmp/tfplugindocs
 ensure-tfplugindocs: ## Download tfplugindocs locally if necessary.
-	$(call go-get-tool,$(TFPLUGINDOCS),github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@v0.21.0)
+	$(call go-get-tool,$(TFPLUGINDOCS),github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@v0.25.0)
 
 GOLANGCILINT = $(shell go env GOPATH)/bin/golangci-lint
 # Test if golangci-lint is available in the GOPATH, if not, set to local and download if needed
@@ -64,7 +64,7 @@ ifneq ($(shell test -f $(GOLANGCILINT) && echo -n yes),yes)
 GOLANGCILINT = /tmp/golangci-lint
 endif
 ensure-golangci-lint: ## Download golangci-lint locally if necessary.
-	$(call go-get-tool,$(GOLANGCILINT),github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.0)
+	$(call go-get-tool,$(GOLANGCILINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2)
 
 # go-get-tool will 'go get' any package $2 and install it to $1.
 define go-get-tool
@@ -79,4 +79,3 @@ GOBIN=$$gobin go install $(2) ;\
 rm -rf $$TMP_DIR ;\
 }
 endef
-

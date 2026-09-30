@@ -7,25 +7,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/pingcap/errors"
 )
 
 type httpClient struct {
-	client  *http.Client
-	baseUrl url.URL
+	client       *http.Client
+	baseUrl      url.URL
+	queryTimeout time.Duration
 }
 
 type HTTPClientConfig struct {
-	Protocol  string
-	Host      string
-	Port      uint16
-	BasicAuth *BasicAuth
-	TLSConfig *tls.Config
+	Protocol     string
+	Host         string
+	Port         uint16
+	BasicAuth    *BasicAuth
+	TLSConfig    *tls.Config
+	DialTimeout  time.Duration
+	QueryTimeout time.Duration
 }
 
 func NewHTTPClient(config HTTPClientConfig) (ClickhouseClient, error) {
@@ -64,10 +69,17 @@ func NewHTTPClient(config HTTPClientConfig) (ClickhouseClient, error) {
 		}
 	}
 
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if config.DialTimeout > 0 {
+		dialContext = (&net.Dialer{Timeout: config.DialTimeout}).DialContext
+	}
+
 	return &httpClient{
-		baseUrl: *baseUrl,
+		baseUrl:      *baseUrl,
+		queryTimeout: config.QueryTimeout,
 		client: &http.Client{
 			Transport: &http.Transport{
+				DialContext:     dialContext,
 				TLSClientConfig: config.TLSConfig,
 			},
 		},
@@ -75,7 +87,7 @@ func NewHTTPClient(config HTTPClientConfig) (ClickhouseClient, error) {
 }
 
 func (i *httpClient) Select(ctx context.Context, qry string, callback func(Row) error) error {
-	body, err := i.runQuery(ctx, qry)
+	body, err := i.runQuery(ctx, qry, nil)
 	if err != nil {
 		return errors.WithMessage(err, "error running query")
 	}
@@ -97,8 +109,14 @@ func (i *httpClient) Select(ctx context.Context, qry string, callback func(Row) 
 	return nil
 }
 
-func (i *httpClient) Exec(ctx context.Context, qry string) error {
-	_, err := i.runQuery(ctx, qry)
+func (i *httpClient) Exec(ctx context.Context, qry string, params ...map[string]string) error {
+	var err error
+
+	if len(params) > 0 {
+		_, err = i.runQuery(ctx, qry, params[0])
+	} else {
+		_, err = i.runQuery(ctx, qry, nil)
+	}
 	if err != nil {
 		return errors.WithMessage(err, "error running query")
 	}
@@ -106,10 +124,22 @@ func (i *httpClient) Exec(ctx context.Context, qry string) error {
 	return nil
 }
 
-func (i *httpClient) runQuery(ctx context.Context, qry string) (string, error) {
-	ctx = tflog.SetField(ctx, "Query", qry)
+func (i *httpClient) runQuery(ctx context.Context, qry string, params map[string]string) (string, error) {
+	ctx, cancel := queryContext(ctx, i.queryTimeout)
+	defer cancel()
 
-	req, err := http.NewRequest(http.MethodPost, i.baseUrl.String(), strings.NewReader(qry))
+	ctx = tflog.SetField(ctx, "Query", loggableQuery(ctx, qry))
+
+	reqURL := i.baseUrl
+	if len(params) > 0 {
+		q := reqURL.Query()
+		for k, v := range params {
+			q.Set("param_"+k, v)
+		}
+		reqURL.RawQuery = q.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL.String(), strings.NewReader(qry))
 	if err != nil {
 		return "", errors.WithMessage(err, "error preparing HTTP request")
 	}
@@ -118,10 +148,18 @@ func (i *httpClient) runQuery(ctx context.Context, qry string) (string, error) {
 
 	resp, err := i.client.Do(req)
 	if err != nil {
+		// Do's *url.Error embeds the request URL; drop the query string so param_ secrets don't leak.
+		if uerr, ok := err.(*url.Error); ok {
+			u := *req.URL
+			u.RawQuery = ""
+			uerr.URL = u.Redacted()
+		}
 		return "", errors.WithMessage(err, "error executing query")
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", errors.WithMessage(err, "error reading response")
@@ -134,7 +172,7 @@ func (i *httpClient) runQuery(ctx context.Context, qry string) (string, error) {
 		body = buf.Bytes()
 	}
 
-	ctx = tflog.SetField(ctx, "QueryResult", string(body))
+	ctx = tflog.SetField(ctx, "QueryResult", loggableResult(ctx, string(body)))
 
 	if resp.StatusCode != http.StatusOK {
 		return "", errors.New(string(body))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -23,8 +24,11 @@ import (
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/dictionary"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/grantprivilege"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/grantrole"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/maskingpolicy"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/materializedview"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/namedcollection"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/role"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/rowpolicy"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/setting"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/settingsprofile"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/settingsprofileassociation"
@@ -41,6 +45,8 @@ const (
 
 	authStrategyPassword  = "password"
 	authStrategyBasicAuth = "basicauth"
+
+	defaultQueryTimeout = 300 * time.Second
 )
 
 var (
@@ -115,6 +121,10 @@ func (p *Provider) Schema(ctx context.Context, req provider.SchemaRequest, resp 
 						Sensitive:   true,
 						Description: "PEM-encoded CA certificate to use for TLS verification. When specified, only this CA will be trusted for server certificate validation.",
 					},
+					"server_name": schema.StringAttribute{
+						Optional:    true,
+						Description: "Hostname to use for TLS SNI and certificate validation, if different from `host`. Useful when connecting through a tunnel or port-forward that resolves `host` to a different address but the server certificate is still issued for the original hostname.",
+					},
 				},
 				Optional:    true,
 				Description: "TLS configuration options",
@@ -126,13 +136,73 @@ func (p *Provider) Schema(ctx context.Context, req provider.SchemaRequest, resp 
 					int64validator.AtLeast(1),
 				},
 			},
+			"dial_timeout": schema.Int64Attribute{
+				Optional:    true,
+				Description: "Timeout in seconds for establishing connections to ClickHouse. Useful when the ClickHouse instance takes time to start up from an idle state.",
+				Validators: []validator.Int64{
+					int64validator.AtLeast(1),
+				},
+			},
+			"query_timeout": schema.Int64Attribute{
+				Optional:    true,
+				Description: "Timeout in seconds for each query ran against ClickHouse. Defaults to 300.",
+				Validators: []validator.Int64{
+					int64validator.AtLeast(1),
+				},
+			},
 		},
 	}
+}
+
+// buildTLSConfig builds a *tls.Config from the provider's tls_config block.
+func buildTLSConfig(cfg *TLSConfig) (*tls.Config, error) {
+	tlsConfig := &tls.Config{} //nolint:gosec
+
+	if cfg == nil {
+		return tlsConfig, nil
+	}
+
+	if !cfg.InsecureSkipVerify.IsNull() {
+		tlsConfig.InsecureSkipVerify = cfg.InsecureSkipVerify.ValueBool()
+	}
+
+	if !cfg.CACert.IsNull() && cfg.CACert.ValueString() != "" {
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM([]byte(cfg.CACert.ValueString())) {
+			return nil, errors.New("failed to parse ca_cert as PEM-encoded certificate")
+		}
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	if !cfg.ServerName.IsNull() && cfg.ServerName.ValueString() != "" {
+		tlsConfig.ServerName = cfg.ServerName.ValueString()
+	}
+
+	return tlsConfig, nil
 }
 
 func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	var data Model
 	var err error
+
+	if !req.Config.Raw.IsFullyKnown() {
+		if req.ClientCapabilities.DeferralAllowed {
+			resp.Deferred = &provider.Deferred{Reason: provider.DeferredReasonProviderConfigUnknown}
+			return
+		}
+
+		// Terraform configures the provider again with known values before apply.
+		var dbopsClient dbops.Client
+		dbopsClient, err = dbops.NewClient(clickhouseclient.NewUnknownConfigClient())
+		if err != nil {
+			resp.Diagnostics.AddError("error initializing dbops client", fmt.Sprintf("%+v\n", err))
+			return
+		}
+
+		resp.ResourceData = dbopsClient
+		resp.DataSourceData = dbopsClient
+		return
+	}
 
 	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
 
@@ -140,9 +210,14 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 		return
 	}
 
-	if data.Host.IsUnknown() || data.Protocol.IsUnknown() || data.Port.IsUnknown() || data.AuthConfig.Strategy.IsUnknown() || data.AuthConfig.Username.IsUnknown() {
-		// We don't know the service data yet.
-		return
+	var dialTimeout time.Duration
+	if !data.DialTimeout.IsNull() {
+		dialTimeout = time.Duration(data.DialTimeout.ValueInt64()) * time.Second
+	}
+
+	queryTimeout := defaultQueryTimeout
+	if !data.QueryTimeout.IsNull() {
+		queryTimeout = time.Duration(data.QueryTimeout.ValueInt64()) * time.Second
 	}
 
 	var clickhouseClient clickhouseclient.ClickhouseClient
@@ -186,28 +261,24 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 
 			var nativeTLSConfig *tls.Config
 			if data.Protocol.ValueString() == protocolNativeSecure {
-				nativeTLSConfig = &tls.Config{} //nolint:gosec
-				if data.TLSConfig != nil {
-					if !data.TLSConfig.InsecureSkipVerify.IsNull() {
-						nativeTLSConfig.InsecureSkipVerify = data.TLSConfig.InsecureSkipVerify.ValueBool()
-					}
-					if !data.TLSConfig.CACert.IsNull() && data.TLSConfig.CACert.ValueString() != "" {
-						caCertPool := x509.NewCertPool()
-						if !caCertPool.AppendCertsFromPEM([]byte(data.TLSConfig.CACert.ValueString())) {
-							resp.Diagnostics.AddError("invalid configuration", "failed to parse ca_cert as PEM-encoded certificate")
-							return
-						}
-						nativeTLSConfig.RootCAs = caCertPool
-					}
+				var tlsErr error
+				nativeTLSConfig, tlsErr = buildTLSConfig(data.TLSConfig)
+				if tlsErr != nil {
+					resp.Diagnostics.AddError("invalid configuration", tlsErr.Error())
+					return
 				}
 			}
 
-			clickhouseClient, err = clickhouseclient.NewNativeClient(clickhouseclient.NativeClientConfig{
+			nativeConfig := clickhouseclient.NativeClientConfig{
 				Host:             data.Host.ValueString(),
 				Port:             port,
 				UserPasswordAuth: auth,
 				TLSConfig:        nativeTLSConfig,
-			})
+			}
+
+			nativeConfig.DialTimeout = dialTimeout
+			nativeConfig.QueryTimeout = queryTimeout
+			clickhouseClient, err = clickhouseclient.NewNativeClient(nativeConfig)
 		case protocolHTTP:
 			fallthrough
 		case protocolHTTPS:
@@ -248,23 +319,15 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 			protocol := "http"
 			if data.Protocol.ValueString() == protocolHTTPS {
 				protocol = "https"
-				tlsConfig = &tls.Config{} //nolint:gosec
-				if data.TLSConfig != nil {
-					if !data.TLSConfig.InsecureSkipVerify.IsNull() {
-						tlsConfig.InsecureSkipVerify = data.TLSConfig.InsecureSkipVerify.ValueBool()
-					}
-					if !data.TLSConfig.CACert.IsNull() && data.TLSConfig.CACert.ValueString() != "" {
-						caCertPool := x509.NewCertPool()
-						if !caCertPool.AppendCertsFromPEM([]byte(data.TLSConfig.CACert.ValueString())) {
-							resp.Diagnostics.AddError("invalid configuration", "failed to parse ca_cert as PEM-encoded certificate")
-							return
-						}
-						tlsConfig.RootCAs = caCertPool
-					}
+				var tlsErr error
+				tlsConfig, tlsErr = buildTLSConfig(data.TLSConfig)
+				if tlsErr != nil {
+					resp.Diagnostics.AddError("invalid configuration", tlsErr.Error())
+					return
 				}
 			}
 
-			config := clickhouseclient.HTTPClientConfig{
+			httpConfig := clickhouseclient.HTTPClientConfig{
 				Protocol:  protocol,
 				Host:      data.Host.ValueString(),
 				Port:      port,
@@ -272,7 +335,9 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 				TLSConfig: tlsConfig,
 			}
 
-			clickhouseClient, err = clickhouseclient.NewHTTPClient(config)
+			httpConfig.DialTimeout = dialTimeout
+			httpConfig.QueryTimeout = queryTimeout
+			clickhouseClient, err = clickhouseclient.NewHTTPClient(httpConfig)
 		}
 	}
 
@@ -307,9 +372,12 @@ func (p *Provider) Resources(ctx context.Context) []func() tfresource.Resource {
 		user.NewResource,
 		grantrole.NewResource,
 		grantprivilege.NewResource,
+		maskingpolicy.NewResource,
 		settingsprofile.NewResource,
 		setting.NewResource,
 		settingsprofileassociation.NewResource,
+		rowpolicy.NewResource,
+		namedcollection.NewResource,
 	}
 }
 

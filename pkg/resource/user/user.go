@@ -13,7 +13,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int32planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -27,9 +26,10 @@ import (
 var userResourceDescription string
 
 var (
-	_ resource.Resource               = &Resource{}
-	_ resource.ResourceWithConfigure  = &Resource{}
-	_ resource.ResourceWithModifyPlan = &Resource{}
+	_ resource.Resource                     = &Resource{}
+	_ resource.ResourceWithConfigure        = &Resource{}
+	_ resource.ResourceWithConfigValidators = &Resource{}
+	_ resource.ResourceWithModifyPlan       = &Resource{}
 )
 
 func NewResource() resource.Resource {
@@ -65,39 +65,32 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			"password_sha256_hash": schema.StringAttribute{
 				Optional:    true,
 				Sensitive:   true,
-				Description: "SHA256 hash of the password to be set for the user. Use this for Terraform/OpenTofu < 1.11. Conflicts with password_sha256_hash_wo. Changes to this field will replace the user.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
+				Description: "SHA256 hash of the password to be set for the user. Use this for Terraform/OpenTofu < 1.11. Conflicts with password_sha256_hash_wo. Changes to this field update the user in place.",
 				Validators: []validator.String{
 					stringvalidator.RegexMatches(regexp.MustCompile(`^[a-fA-F0-9]{64}$`), "password_sha256_hash must be a valid SHA256 hash"),
 					stringvalidator.ConflictsWith(path.MatchRoot("password_sha256_hash_wo")),
 				},
-				DeprecationMessage: "Use password_sha256_hash_wo if you're on Terraform or OpenTofu >= 1.11",
+				DeprecationMessage: "Prefer auth.sha256_hash block",
 			},
 			"password_sha256_hash_wo": schema.StringAttribute{
 				Optional:    true,
 				Description: "SHA256 hash of the password to be set for the user. Use this for Terraform/OpenTofu >= 1.11. Conflicts with password_sha256_hash.",
 				Sensitive:   true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
 				Validators: []validator.String{
 					stringvalidator.RegexMatches(regexp.MustCompile(`^[a-fA-F0-9]{64}$`), "password_sha256_hash must be a valid SHA256 hash"),
 					stringvalidator.AlsoRequires(path.MatchRoot("password_sha256_hash_wo_version")),
 					stringvalidator.ConflictsWith(path.MatchRoot("password_sha256_hash")),
 				},
-				WriteOnly: true,
+				WriteOnly:          true,
+				DeprecationMessage: "Prefer auth.sha256_hash block",
 			},
 			"password_sha256_hash_wo_version": schema.Int32Attribute{
 				Optional:    true,
-				Description: "Version of the password_sha256_hash_wo field. Bump this value to require a force update of the password on the user.",
-				PlanModifiers: []planmodifier.Int32{
-					int32planmodifier.RequiresReplace(),
-				},
+				Description: "Version of the password_sha256_hash_wo field. Bump this value to update the password on the user.",
 				Validators: []validator.Int32{
 					int32validator.AlsoRequires(path.MatchRoot("password_sha256_hash_wo")),
 				},
+				DeprecationMessage: "Prefer auth.sha256_hash block",
 			},
 			"host_ips": schema.SetAttribute{
 				ElementType: types.StringType,
@@ -108,8 +101,15 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 				},
 			},
 		},
+		Blocks: map[string]schema.Block{
+			"auth": userAuthBlock(),
+		},
 		MarkdownDescription: userResourceDescription,
 	}
+}
+
+func (r *Resource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
+	return authConfigValidators()
 }
 
 func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
@@ -176,24 +176,9 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		return
 	}
 
-	var passwordHash string
-	switch {
-	case !plan.PasswordSha256Hash.IsNull():
-		// sensitive attribute for TF < 1.11
-		passwordHash = plan.PasswordSha256Hash.ValueString()
-	case !config.PasswordSha256HashWO.IsNull():
-		// sensitive attribute for TF >= 1.11
-		passwordHash = config.PasswordSha256HashWO.ValueString()
-	default:
-		resp.Diagnostics.AddError(
-			"Missing password configuration",
-			"Either password_sha256_hash or password_sha256_hash_wo must be specified",
-		)
-	}
-
 	user := dbops.User{
-		Name:               plan.Name.ValueString(),
-		PasswordSha256Hash: passwordHash,
+		Name:        plan.Name.ValueString(),
+		AuthMethods: resolveAuthMethods(plan, config),
 	}
 
 	// Only set host IPs if provided
@@ -223,6 +208,7 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		PasswordSha256Hash:          plan.PasswordSha256Hash,
 		PasswordSha256HashVersionWO: plan.PasswordSha256HashVersionWO,
 		HostIPs:                     plan.HostIPs,
+		Auth:                        plan.Auth,
 	}
 
 	diags = resp.State.Set(ctx, state)
@@ -260,7 +246,12 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan, state User
+	var (
+		plan   User
+		state  User
+		config User
+	)
+
 	diags := req.State.Get(ctx, &state)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -273,9 +264,17 @@ func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp 
 		return
 	}
 
-	user, err := r.client.UpdateUser(ctx, dbops.User{
-		ID:   state.ID.ValueString(),
-		Name: plan.Name.ValueString(),
+	// Write-only attributes are only populated in the config.
+	diags = req.Config.Get(ctx, &config)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	updatedUser, err := r.client.UpdateUser(ctx, dbops.User{
+		ID:          state.ID.ValueString(),
+		Name:        plan.Name.ValueString(),
+		AuthMethods: resolveAuthMethods(plan, config),
 	}, plan.ClusterName.ValueStringPointer())
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -285,8 +284,17 @@ func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp 
 		return
 	}
 
-	state.Name = types.StringValue(user.Name)
-	diags = resp.State.Set(ctx, &state)
+	newState := User{
+		ClusterName:                 plan.ClusterName,
+		ID:                          state.ID,
+		Name:                        types.StringValue(updatedUser.Name),
+		PasswordSha256Hash:          plan.PasswordSha256Hash,
+		PasswordSha256HashVersionWO: plan.PasswordSha256HashVersionWO,
+		HostIPs:                     plan.HostIPs,
+		Auth:                        plan.Auth,
+	}
+
+	diags = resp.State.Set(ctx, &newState)
 	resp.Diagnostics.Append(diags...)
 }
 
