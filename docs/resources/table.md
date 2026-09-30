@@ -4,26 +4,50 @@ page_title: "clickhousedbops_table Resource - clickhousedbops"
 subcategory: ""
 description: |-
   Use the clickhousedbops_table resource to manage ClickHouse objects created with CREATE TABLE, including local tables, distributed tables, Kafka tables, and other engine-backed table definitions.
-  The columns attribute is a list of objects so you can define a single local value and reuse it across multiple resources.
+  The columns attribute is a list of objects so you can define a single local value and reuse it across multiple resources. A column type can contain Nullable(...) verbatim, or you can set nullable = true: both forms are equal. A column can also carry a codec, a column ttl, and one of default_expression, materialized_expression, alias_expression or ephemeral_expression.
+  The indexes, projections and constraints attributes are compared by name, not by position, because ClickHouse lists them in creation order.
   Update behavior is engine-aware:
-  MergeTree-family tables are updated in place for supported column changes, SAMPLE BY, TTL, append-only ORDER BY extensions that introduce newly-added columns in the same change, and mutable table settings.Distributed tables are updated in place for column changes, but settings changes still force replacement.Kafka tables are treated as replacement-oriented for schema changes because ClickHouse does not support the necessary ALTER TABLE operations there.Engines without an explicit in-place strategy currently fall back to replacement for schema changes.
-  Changes that ClickHouse cannot alter safely in place, such as engine changes, partition_by, primary_key, as_select, unsupported order_by rewrites, or readonly table settings, still force replacement.
+  MergeTree-family tables are updated in place for supported column changes (including codec and column ttl), indexes, projections, constraints, SAMPLE BY, TTL, append-only ORDER BY extensions that introduce newly-added columns in the same change, and mutable table settings. A changed index, projection or constraint is dropped and added again.Distributed tables are updated in place for column changes, but settings changes still force replacement.Kafka tables are treated as replacement-oriented for schema changes because ClickHouse does not support the necessary ALTER TABLE operations there.Engines without an explicit in-place strategy currently fall back to replacement for schema changes.
+  Changes that ClickHouse cannot alter safely in place, such as engine changes, partition_by, primary_key, as_select, unsupported order_by rewrites, readonly table settings, or removing ephemeral_expression from a column, still force replacement.
+  Column changes use ADD COLUMN IF NOT EXISTS and DROP COLUMN IF EXISTS. Every ALTER TABLE runs with alter_sync = 2, so it returns when all replicas have applied it.
+  unmanaged_columns and unmanaged_indexes are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.
+  When the provider sets fanout_cluster, the resource acts on every node of that cluster and never uses ON CLUSTER:
+  Create and update make every node hold the configured definition. A missing table is created. An existing table is altered in place from its current definition on that node; when the difference needs a replacement, the apply fails with an error that names the node and the attributes. For a Replicated engine the ALTER runs on the first replica of each shard that has the table, because ClickHouse replicates it; only MODIFY SETTING and RESET SETTING run on every replica, because ClickHouse does not replicate them. A new replica of an existing shard is created with the column and index list that the shard already holds.Read queries every node. The nodes attribute lists the hosts that have the table. When a node is missing the table, or a node joins the cluster later, the plan shows an in-place update of nodes and the apply creates the table there. When one node holds a different definition, the plan shows that difference.Delete drops the table on every node with DROP ... IF EXISTS ... SYNC.cluster_name cannot be set together with fanout_cluster.
+  Creating a table that already exists on a node is an error, unless the provider sets adopt_existing = true. With adoption the existing table is changed in place to match the configuration, or left alone when it already matches.
+  SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in SHOW CREATE, because ClickHouse rewrites expressions into its canonical form.
 ---
 
 # clickhousedbops_table (Resource)
 
 Use the *clickhousedbops_table* resource to manage ClickHouse objects created with `CREATE TABLE`, including local tables, distributed tables, Kafka tables, and other engine-backed table definitions.
 
-The `columns` attribute is a list of objects so you can define a single local value and reuse it across multiple resources.
+The `columns` attribute is a list of objects so you can define a single local value and reuse it across multiple resources. A column type can contain `Nullable(...)` verbatim, or you can set `nullable = true`: both forms are equal. A column can also carry a `codec`, a column `ttl`, and one of `default_expression`, `materialized_expression`, `alias_expression` or `ephemeral_expression`.
+
+The `indexes`, `projections` and `constraints` attributes are compared by name, not by position, because ClickHouse lists them in creation order.
 
 Update behavior is engine-aware:
 
-- MergeTree-family tables are updated in place for supported column changes, `SAMPLE BY`, `TTL`, append-only `ORDER BY` extensions that introduce newly-added columns in the same change, and mutable table settings.
+- MergeTree-family tables are updated in place for supported column changes (including `codec` and column `ttl`), indexes, projections, constraints, `SAMPLE BY`, `TTL`, append-only `ORDER BY` extensions that introduce newly-added columns in the same change, and mutable table settings. A changed index, projection or constraint is dropped and added again.
 - Distributed tables are updated in place for column changes, but settings changes still force replacement.
 - Kafka tables are treated as replacement-oriented for schema changes because ClickHouse does not support the necessary `ALTER TABLE` operations there.
 - Engines without an explicit in-place strategy currently fall back to replacement for schema changes.
 
-Changes that ClickHouse cannot alter safely in place, such as engine changes, `partition_by`, `primary_key`, `as_select`, unsupported `order_by` rewrites, or readonly table settings, still force replacement.
+Changes that ClickHouse cannot alter safely in place, such as engine changes, `partition_by`, `primary_key`, `as_select`, unsupported `order_by` rewrites, readonly table settings, or removing `ephemeral_expression` from a column, still force replacement.
+
+Column changes use `ADD COLUMN IF NOT EXISTS` and `DROP COLUMN IF EXISTS`. Every `ALTER TABLE` runs with `alter_sync = 2`, so it returns when all replicas have applied it.
+
+`unmanaged_columns` and `unmanaged_indexes` are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.
+
+When the provider sets `fanout_cluster`, the resource acts on every node of that cluster and never uses `ON CLUSTER`:
+
+- Create and update make every node hold the configured definition. A missing table is created. An existing table is altered in place from its current definition on that node; when the difference needs a replacement, the apply fails with an error that names the node and the attributes. For a `Replicated*` engine the `ALTER` runs on the first replica of each shard that has the table, because ClickHouse replicates it; only `MODIFY SETTING` and `RESET SETTING` run on every replica, because ClickHouse does not replicate them. A new replica of an existing shard is created with the column and index list that the shard already holds.
+- Read queries every node. The `nodes` attribute lists the hosts that have the table. When a node is missing the table, or a node joins the cluster later, the plan shows an in-place update of `nodes` and the apply creates the table there. When one node holds a different definition, the plan shows that difference.
+- Delete drops the table on every node with `DROP ... IF EXISTS ... SYNC`.
+- `cluster_name` cannot be set together with `fanout_cluster`.
+
+Creating a table that already exists on a node is an error, unless the provider sets `adopt_existing = true`. With adoption the existing table is changed in place to match the configuration, or left alone when it already matches.
+
+SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in `SHOW CREATE`, because ClickHouse rewrites expressions into its canonical form.
 
 ## Example Usage
 
@@ -38,7 +62,7 @@ locals {
 
 resource "clickhousedbops_table" "events_local" {
   cluster_name = "cluster"
-  database     = "posthog"
+  database     = "analytics"
   name         = "events_local"
   engine       = "MergeTree()"
   partition_by = "toYYYYMM(created_at)"
@@ -48,9 +72,9 @@ resource "clickhousedbops_table" "events_local" {
 
 resource "clickhousedbops_table" "events" {
   cluster_name = "cluster"
-  database     = "posthog"
+  database     = "analytics"
   name         = "events"
-  engine       = "Distributed('cluster', 'posthog', '${clickhousedbops_table.events_local.name}', rand())"
+  engine       = "Distributed('cluster', 'analytics', '${clickhousedbops_table.events_local.name}', rand())"
   columns      = local.event_columns
 }
 ```
@@ -67,19 +91,25 @@ resource "clickhousedbops_table" "events" {
 ### Optional
 
 - `as_select` (String) Optional raw query appended as AS <query> after the table definition
-- `cluster_name` (String) Name of the cluster to create the table into. If omitted, the DDL runs only on the connected replica.
+- `cluster_name` (String) Name of the cluster to create the table into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.
 - `columns` (Attributes List) Structured column definitions. This can be assigned directly from a local list of objects. (see [below for nested schema](#nestedatt--columns))
+- `constraints` (Attributes List) CHECK constraints. They are compared by name, not by position. (see [below for nested schema](#nestedatt--constraints))
+- `indexes` (Attributes List) Data skipping indexes. They are compared by name, not by position. (see [below for nested schema](#nestedatt--indexes))
 - `order_by` (String) Raw ORDER BY clause expression
 - `partition_by` (String) Raw PARTITION BY clause expression
 - `primary_key` (String) Raw PRIMARY KEY clause expression
+- `projections` (Attributes List) Projections. They are compared by name, not by position. (see [below for nested schema](#nestedatt--projections))
 - `sample_by` (String) Raw SAMPLE BY clause expression
 - `settings` (String) Raw SETTINGS clause body
 - `ttl` (String) Raw TTL clause expression
+- `unmanaged_columns` (List of String) RE2 regular expressions. A remote column whose name matches any of them and that is not declared in columns is ignored: the provider does not report, change, or drop it. A pattern matches anywhere in the name unless it is anchored with ^ and $.
+- `unmanaged_indexes` (List of String) RE2 regular expressions. A remote index whose name matches any of them and that is not declared in indexes is ignored: the provider does not report, change, or drop it. A pattern matches anywhere in the name unless it is anchored with ^ and $.
 
 ### Read-Only
 
 - `create_statement` (String) Canonical CREATE statement reported by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.table or database.table
+- `nodes` (List of String) Hosts where the table exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified object name in the form database.table
 
 <a id="nestedatt--columns"></a>
@@ -88,12 +118,48 @@ resource "clickhousedbops_table" "events" {
 Required:
 
 - `name` (String) Column name
-- `nullable` (Boolean) Whether the provider should wrap the column type in Nullable(...)
-- `type` (String) Column type definition without the Nullable wrapper
+- `type` (String) Column type definition. It can contain Nullable(...) verbatim, or leave it out and set nullable instead.
 
 Optional:
 
 - `alias_expression` (String) Raw SQL expression to use in an ALIAS clause
+- `codec` (String) Compression codecs: the text inside CODEC(...), for example ZSTD(3) or Delta(4), ZSTD(1)
 - `comment` (String) Optional column comment
 - `default_expression` (String) Raw SQL expression to use in a DEFAULT clause
+- `ephemeral_expression` (String) Raw SQL expression to use in an EPHEMERAL clause
 - `materialized_expression` (String) Raw SQL expression to use in a MATERIALIZED clause
+- `nullable` (Boolean) Whether the provider should wrap the column type in Nullable(...). Defaults to false.
+- `ttl` (String) Raw column TTL expression
+
+
+<a id="nestedatt--constraints"></a>
+### Nested Schema for `constraints`
+
+Required:
+
+- `check` (String) Raw CHECK expression
+- `name` (String) Constraint name
+
+
+<a id="nestedatt--indexes"></a>
+### Nested Schema for `indexes`
+
+Required:
+
+- `expression` (String) Raw index expression
+- `name` (String) Index name
+- `type` (String) Index type, for example minmax or bloom_filter(0.01)
+
+Optional:
+
+- `granularity` (Number) Index granularity. Defaults to 1.
+
+
+<a id="nestedatt--projections"></a>
+### Nested Schema for `projections`
+
+Required:
+
+- `name` (String) Projection name
+- `query` (String) Raw projection query: the text inside PROJECTION name (...)
+- `settings` (String) Projection settings: the text inside WITH SETTINGS (...)

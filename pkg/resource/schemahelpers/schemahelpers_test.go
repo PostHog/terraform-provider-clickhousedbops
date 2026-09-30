@@ -93,6 +93,29 @@ func TestColumnEqual(t *testing.T) {
 		}
 	})
 
+	t.Run("effective type, codec, ttl and ephemeral", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			left  dbops.Column
+			right dbops.Column
+			want  bool
+		}{
+			{name: "nullable flag equals verbatim Nullable type", left: dbops.Column{Name: "id", Type: "String", Nullable: true}, right: dbops.Column{Name: "id", Type: "Nullable(String)"}, want: true},
+			{name: "nullable flag on a Nullable type is not wrapped twice", left: dbops.Column{Name: "id", Type: "Nullable(String)", Nullable: true}, right: dbops.Column{Name: "id", Type: "Nullable(String)"}, want: true},
+			{name: "type formatting", left: dbops.Column{Name: "id", Type: "Tuple(\n  a String,\n  b UInt64\n)"}, right: dbops.Column{Name: "id", Type: "Tuple(a String, b UInt64)"}, want: true},
+			{name: "codec formatting", left: dbops.Column{Name: "id", Type: "UInt64", Codec: "Delta(8),ZSTD(1)"}, right: dbops.Column{Name: "id", Type: "UInt64", Codec: "Delta(8), ZSTD(1)"}, want: true},
+			{name: "codec differs", left: dbops.Column{Name: "id", Type: "UInt64", Codec: "ZSTD(1)"}, right: dbops.Column{Name: "id", Type: "UInt64", Codec: "ZSTD(3)"}},
+			{name: "ttl differs", left: dbops.Column{Name: "id", Type: "UInt64", TTL: "ts + toIntervalDay(1)"}, right: dbops.Column{Name: "id", Type: "UInt64"}},
+			{name: "ephemeral differs from default", left: dbops.Column{Name: "id", Type: "UInt64", EphemeralExpression: strPtr("1")}, right: dbops.Column{Name: "id", Type: "UInt64", DefaultExpression: strPtr("1")}},
+			{name: "whitespace inside a string literal matters", left: dbops.Column{Name: "id", Type: "String", DefaultExpression: strPtr("'a  b'")}, right: dbops.Column{Name: "id", Type: "String", DefaultExpression: strPtr("'a b'")}},
+		}
+		for _, tt := range tests {
+			if got := ColumnEqual(tt.left, tt.right); got != tt.want {
+				t.Errorf("%s: ColumnEqual() = %v, want %v", tt.name, got, tt.want)
+			}
+		}
+	})
+
 	t.Run("materialized vs alias", func(t *testing.T) {
 		a := base
 		a.MaterializedExpression = strPtr("x")

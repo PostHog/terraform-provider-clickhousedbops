@@ -143,6 +143,21 @@ func (p *Provider) Schema(ctx context.Context, req provider.SchemaRequest, resp 
 					int64validator.AtLeast(1),
 				},
 			},
+			"fanout_cluster": schema.StringAttribute{
+				Optional:    true,
+				Description: "Name of a cluster in system.clusters. When set, the table, view, materialized_view and dictionary resources connect to every node of this cluster and run their DDL on each node, without ON CLUSTER. The nodes are reached at the host_name that system.clusters reports, with the protocol, authentication, TLS and timeouts of this provider. The port is the one from system.clusters for the native protocol and the configured port for every other protocol.",
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"adopt_existing": schema.BoolAttribute{
+				Optional:    true,
+				Description: "When true, creating a table, view, materialized view or dictionary that already exists adopts it: the existing object is changed in place to match the configuration. When false (the default), creating an object that already exists is an error.",
+			},
+			"ignore_column_order": schema.BoolAttribute{
+				Optional:    true,
+				Description: "When true, a table whose columns match the configuration in a different order is not altered. New columns are still added after the column that precedes them in the configuration.",
+			},
 			"query_timeout": schema.Int64Attribute{
 				Optional:    true,
 				Description: "Timeout in seconds for each query ran against ClickHouse. Defaults to 300.",
@@ -220,135 +235,135 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 		queryTimeout = time.Duration(data.QueryTimeout.ValueInt64()) * time.Second
 	}
 
-	var clickhouseClient clickhouseclient.ClickhouseClient
-	{
-		switch data.Protocol.ValueString() {
-		case protocolNative:
-			fallthrough
-		case protocolNativeSecure:
-			var auth *clickhouseclient.UserPasswordAuth
-			switch data.AuthConfig.Strategy.ValueString() {
-			case authStrategyPassword:
-				auth = &clickhouseclient.UserPasswordAuth{
-					Username: data.AuthConfig.Username.ValueString(),
-				}
+	var port uint16
+	if !data.Port.IsUnknown() {
+		portVal := data.Port.ValueInt32()
+		if portVal <= 0 || portVal > 65535 {
+			resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid port %s.", data.Port.String()))
+			return
+		}
 
-				if !data.AuthConfig.Password.IsNull() {
-					auth.Password = data.AuthConfig.Password.ValueString()
-				}
+		port = uint16(portVal)
+	}
 
-				valid, errorStrings := auth.ValidateConfig()
-				if !valid {
-					resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy configuration. %s", strings.Join(errorStrings, ", ")))
-				}
-			default:
-				resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy %q. %s protocol only supports %q", data.AuthConfig.Strategy, protocolNative, authStrategyPassword))
+	// newClickhouseClient opens a connection to one host with the provider's protocol,
+	// authentication, TLS and timeouts.
+	var newClickhouseClient func(host string, port uint16) (clickhouseclient.ClickhouseClient, error)
+	switch data.Protocol.ValueString() {
+	case protocolNative:
+		fallthrough
+	case protocolNativeSecure:
+		var auth *clickhouseclient.UserPasswordAuth
+		switch data.AuthConfig.Strategy.ValueString() {
+		case authStrategyPassword:
+			auth = &clickhouseclient.UserPasswordAuth{
+				Username: data.AuthConfig.Username.ValueString(),
+			}
+
+			if !data.AuthConfig.Password.IsNull() {
+				auth.Password = data.AuthConfig.Password.ValueString()
+			}
+
+			valid, errorStrings := auth.ValidateConfig()
+			if !valid {
+				resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy configuration. %s", strings.Join(errorStrings, ", ")))
+			}
+		default:
+			resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy %q. %s protocol only supports %q", data.AuthConfig.Strategy, protocolNative, authStrategyPassword))
+			return
+		}
+
+		var nativeTLSConfig *tls.Config
+		if data.Protocol.ValueString() == protocolNativeSecure {
+			var tlsErr error
+			nativeTLSConfig, tlsErr = buildTLSConfig(data.TLSConfig)
+			if tlsErr != nil {
+				resp.Diagnostics.AddError("invalid configuration", tlsErr.Error())
 				return
 			}
+		}
 
-			var port uint16
-			{
-				if !data.Port.IsUnknown() {
-					portVal := data.Port.ValueInt32()
-					if portVal <= 0 || portVal > 65535 {
-						resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid port %s.", data.Port.String()))
-						return
-					}
-
-					port = uint16(portVal)
-				}
-			}
-
-			var nativeTLSConfig *tls.Config
-			if data.Protocol.ValueString() == protocolNativeSecure {
-				var tlsErr error
-				nativeTLSConfig, tlsErr = buildTLSConfig(data.TLSConfig)
-				if tlsErr != nil {
-					resp.Diagnostics.AddError("invalid configuration", tlsErr.Error())
-					return
-				}
-			}
-
-			nativeConfig := clickhouseclient.NativeClientConfig{
-				Host:             data.Host.ValueString(),
+		newClickhouseClient = func(host string, port uint16) (clickhouseclient.ClickhouseClient, error) {
+			return clickhouseclient.NewNativeClient(clickhouseclient.NativeClientConfig{
+				Host:             host,
 				Port:             port,
 				UserPasswordAuth: auth,
 				TLSConfig:        nativeTLSConfig,
+				DialTimeout:      dialTimeout,
+				QueryTimeout:     queryTimeout,
+			})
+		}
+	case protocolHTTP:
+		fallthrough
+	case protocolHTTPS:
+		var auth *clickhouseclient.BasicAuth
+		switch data.AuthConfig.Strategy.ValueString() {
+		case authStrategyBasicAuth:
+			auth = &clickhouseclient.BasicAuth{
+				Username: data.AuthConfig.Username.ValueString(),
 			}
 
-			nativeConfig.DialTimeout = dialTimeout
-			nativeConfig.QueryTimeout = queryTimeout
-			clickhouseClient, err = clickhouseclient.NewNativeClient(nativeConfig)
-		case protocolHTTP:
-			fallthrough
-		case protocolHTTPS:
-			var auth *clickhouseclient.BasicAuth
-			switch data.AuthConfig.Strategy.ValueString() {
-			case authStrategyBasicAuth:
-				auth = &clickhouseclient.BasicAuth{
-					Username: data.AuthConfig.Username.ValueString(),
-				}
+			if !data.AuthConfig.Password.IsNull() {
+				auth.Password = data.AuthConfig.Password.ValueString()
+			}
 
-				if !data.AuthConfig.Password.IsNull() {
-					auth.Password = data.AuthConfig.Password.ValueString()
-				}
+			valid, errorStrings := auth.ValidateConfig()
+			if !valid {
+				resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy configuration. %s", strings.Join(errorStrings, ", ")))
+			}
+		default:
+			resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy %q. %s protocol only supports %q", data.AuthConfig.Strategy, protocolHTTP, authStrategyBasicAuth))
+			return
+		}
 
-				valid, errorStrings := auth.ValidateConfig()
-				if !valid {
-					resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy configuration. %s", strings.Join(errorStrings, ", ")))
-				}
-			default:
-				resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid authentication strategy %q. %s protocol only supports %q", data.AuthConfig.Strategy, protocolHTTP, authStrategyBasicAuth))
+		var tlsConfig *tls.Config
+		protocol := "http"
+		if data.Protocol.ValueString() == protocolHTTPS {
+			protocol = "https"
+			var tlsErr error
+			tlsConfig, tlsErr = buildTLSConfig(data.TLSConfig)
+			if tlsErr != nil {
+				resp.Diagnostics.AddError("invalid configuration", tlsErr.Error())
 				return
 			}
+		}
 
-			var port uint16
-			{
-				if !data.Port.IsUnknown() {
-					portVal := data.Port.ValueInt32()
-					if portVal <= 0 || portVal > 65535 {
-						resp.Diagnostics.AddError("invalid configuration", fmt.Sprintf("invalid port %s.", data.Port.String()))
-						return
-					}
-
-					port = uint16(portVal)
-				}
-			}
-
-			var tlsConfig *tls.Config
-			protocol := "http"
-			if data.Protocol.ValueString() == protocolHTTPS {
-				protocol = "https"
-				var tlsErr error
-				tlsConfig, tlsErr = buildTLSConfig(data.TLSConfig)
-				if tlsErr != nil {
-					resp.Diagnostics.AddError("invalid configuration", tlsErr.Error())
-					return
-				}
-			}
-
-			httpConfig := clickhouseclient.HTTPClientConfig{
-				Protocol:  protocol,
-				Host:      data.Host.ValueString(),
-				Port:      port,
-				BasicAuth: auth,
-				TLSConfig: tlsConfig,
-			}
-
-			httpConfig.DialTimeout = dialTimeout
-			httpConfig.QueryTimeout = queryTimeout
-			clickhouseClient, err = clickhouseclient.NewHTTPClient(httpConfig)
+		newClickhouseClient = func(host string, port uint16) (clickhouseclient.ClickhouseClient, error) {
+			return clickhouseclient.NewHTTPClient(clickhouseclient.HTTPClientConfig{
+				Protocol:     protocol,
+				Host:         host,
+				Port:         port,
+				BasicAuth:    auth,
+				TLSConfig:    tlsConfig,
+				DialTimeout:  dialTimeout,
+				QueryTimeout: queryTimeout,
+			})
 		}
 	}
 
+	clickhouseClient, err := newClickhouseClient(data.Host.ValueString(), port)
 	if err != nil {
 		resp.Diagnostics.AddError("error initializing clickhouse client", fmt.Sprintf("%+v\n", err))
 		return
 	}
 
-	var dbopsOpts []dbops.ClientOption
+	dbopsOpts := []dbops.ClientOption{
+		dbops.WithHost(data.Host.ValueString()),
+		dbops.WithAdoptExisting(data.AdoptExisting.ValueBool()),
+		dbops.WithIgnoreColumnOrder(data.IgnoreColumnOrder.ValueBool()),
+	}
 	if !data.ReadAfterWriteTimeout.IsNull() {
 		dbopsOpts = append(dbopsOpts, dbops.WithReadAfterWriteTimeout(time.Duration(data.ReadAfterWriteTimeout.ValueInt64())*time.Second))
+	}
+	if !data.FanoutCluster.IsNull() {
+		dbopsOpts = append(dbopsOpts, dbops.WithFanout(data.FanoutCluster.ValueString(), func(host string, clusterPort uint16) (clickhouseclient.ClickhouseClient, error) {
+			// system.clusters reports the native protocol port of each node. Every other
+			// protocol uses the port of the provider configuration.
+			if data.Protocol.ValueString() == protocolNative {
+				return newClickhouseClient(host, clusterPort)
+			}
+			return newClickhouseClient(host, port)
+		}))
 	}
 
 	dbopsClient, err := dbops.NewClient(clickhouseClient, dbopsOpts...)

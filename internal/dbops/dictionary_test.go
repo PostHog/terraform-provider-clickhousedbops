@@ -91,11 +91,11 @@ func TestParseCreateDictionaryDefinition_NullableType(t *testing.T) {
 	if value.Name != "value" {
 		t.Fatalf("unexpected attribute name: %q", value.Name)
 	}
-	if value.Type != "Float64" {
-		t.Fatalf("expected type Float64 (unwrapped), got %q", value.Type)
+	if value.Type != "Nullable(Float64)" {
+		t.Fatalf("expected verbatim type Nullable(Float64), got %q", value.Type)
 	}
-	if !value.Nullable {
-		t.Fatalf("expected Nullable to be true")
+	if value.Nullable {
+		t.Fatalf("expected Nullable to stay false for a verbatim type")
 	}
 }
 
@@ -138,5 +138,33 @@ func TestParseCreateDictionaryDefinition_WithSettings(t *testing.T) {
 
 	if definition.Settings != "max_threads = 4" {
 		t.Fatalf("unexpected settings: %q", definition.Settings)
+	}
+}
+
+func TestParseCreateDictionaryDefinition_RangeAndQuerySource(t *testing.T) {
+	definition, err := parseCreateDictionaryDefinition("CREATE DICTIONARY db.rates\n(\n    `currency` String,\n    `start_date` Date,\n    `end_date` Nullable(Date),\n    `rate` Decimal64(10)\n)\n" +
+		"PRIMARY KEY currency\n" +
+		"SOURCE(CLICKHOUSE(QUERY 'SELECT a, \\'x\\' AS b,\\n c FROM `db`.`t` WHERE s != \\'LAYOUT(\\'' USER 'default' PASSWORD '[HIDDEN]'))\n" +
+		"LIFETIME(MIN 3000 MAX 3600)\n" +
+		"LAYOUT(COMPLEX_KEY_RANGE_HASHED(RANGE_LOOKUP_STRATEGY 'max'))\n" +
+		"RANGE(MIN start_date MAX end_date)")
+	if err != nil {
+		t.Fatalf("parseCreateDictionaryDefinition() error = %v", err)
+	}
+
+	if want := "CLICKHOUSE(QUERY 'SELECT a, \\'x\\' AS b,\\n c FROM `db`.`t` WHERE s != \\'LAYOUT(\\'' USER 'default' PASSWORD '[HIDDEN]')"; definition.Source != want {
+		t.Errorf("source = %q, want %q", definition.Source, want)
+	}
+	if definition.Lifetime != "MIN 3000 MAX 3600" {
+		t.Errorf("unexpected lifetime: %q", definition.Lifetime)
+	}
+	if definition.Layout != "COMPLEX_KEY_RANGE_HASHED(RANGE_LOOKUP_STRATEGY 'max')" {
+		t.Errorf("unexpected layout: %q", definition.Layout)
+	}
+	if definition.Range != "MIN start_date MAX end_date" {
+		t.Errorf("unexpected range: %q", definition.Range)
+	}
+	if len(definition.Attributes) != 4 || definition.Attributes[2].Type != "Nullable(Date)" || definition.Attributes[2].Nullable {
+		t.Errorf("unexpected attributes: %#v", definition.Attributes)
 	}
 }

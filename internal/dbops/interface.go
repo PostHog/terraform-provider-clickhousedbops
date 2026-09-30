@@ -13,6 +13,7 @@ type Client interface {
 
 	CreateDictionary(ctx context.Context, dictionary Dictionary, clusterName *string) (*Dictionary, error)
 	GetDictionary(ctx context.Context, database string, name string, clusterName *string) (*Dictionary, error)
+	ReplaceDictionary(ctx context.Context, dictionary Dictionary, clusterName *string) (*Dictionary, error)
 	DeleteDictionary(ctx context.Context, database string, name string, clusterName *string) error
 
 	CreateTable(ctx context.Context, table Table, clusterName *string) (*Table, error)
@@ -24,11 +25,20 @@ type Client interface {
 
 	CreateView(ctx context.Context, view View, clusterName *string) (*View, error)
 	GetView(ctx context.Context, database string, name string, clusterName *string) (*View, error)
+	ReplaceView(ctx context.Context, view View, clusterName *string) (*View, error)
 	DeleteView(ctx context.Context, database string, name string, clusterName *string) error
 
 	CreateMaterializedView(ctx context.Context, view MaterializedView, clusterName *string) (*MaterializedView, error)
 	GetMaterializedView(ctx context.Context, database string, name string, clusterName *string) (*MaterializedView, error)
+	ModifyMaterializedViewQuery(ctx context.Context, database string, name string, query string) error
 	DeleteMaterializedView(ctx context.Context, database string, name string, clusterName *string) error
+
+	// SchemaNodes returns the nodes that schema objects (tables, views, materialized views,
+	// dictionaries) are applied to: every node of the fan-out cluster, or this client only.
+	SchemaNodes(ctx context.Context) ([]SchemaNode, error)
+	FanoutCluster() string
+	AdoptExisting() bool
+	IgnoreColumnOrder() bool
 
 	CreateRole(ctx context.Context, role Role, clusterName *string) (*Role, error)
 	GetRole(ctx context.Context, id string, clusterName *string) (*Role, error)

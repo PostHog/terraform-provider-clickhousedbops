@@ -4,20 +4,35 @@ page_title: "clickhousedbops_dictionary Resource - clickhousedbops"
 subcategory: ""
 description: |-
   Use the clickhousedbops_dictionary resource to manage ClickHouse dictionaries created with CREATE DICTIONARY.
-  The attributes block is a list of objects so you can define a single local value and reuse it across dictionaries and the tables they read from.
-  Known limitations:
-  Schema changes are currently applied as drop-and-recreate operations.
+  The attributes block is a list of objects so you can define a single local value and reuse it across dictionaries and the tables they read from. An attribute type can contain Nullable(...) verbatim, or you can set nullable = true: both forms are equal.
+  A change of any attribute except database, name and cluster_name is applied in place with CREATE OR REPLACE DICTIONARY.
+  ClickHouse reports PASSWORD '[HIDDEN]' in the SOURCE clause. The provider compares source with the password value masked and keeps the configured text in state, so a change of only the password is not detected.
+  When the provider sets fanout_cluster, the resource acts on every node of that cluster and never uses ON CLUSTER:
+  Create and update make every node hold the configured definition. A missing dictionary is created. A dictionary that differs is replaced in place with CREATE OR REPLACE DICTIONARY.Read queries every node. The nodes attribute lists the hosts that have the dictionary. When a node is missing the dictionary, or a node joins the cluster later, the plan shows an in-place update of nodes and the apply creates the dictionary there. When one node holds a different definition, the plan shows that difference.Delete drops the dictionary on every node with DROP ... IF EXISTS ... SYNC.cluster_name cannot be set together with fanout_cluster.
+  Creating a dictionary that already exists on a node is an error, unless the provider sets adopt_existing = true. With adoption the existing dictionary is changed in place to match the configuration, or left alone when it already matches.
+  SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in SHOW CREATE, because ClickHouse rewrites expressions into its canonical form.
 ---
 
 # clickhousedbops_dictionary (Resource)
 
 Use the *clickhousedbops_dictionary* resource to manage ClickHouse dictionaries created with `CREATE DICTIONARY`.
 
-The `attributes` block is a list of objects so you can define a single local value and reuse it across dictionaries and the tables they read from.
+The `attributes` block is a list of objects so you can define a single local value and reuse it across dictionaries and the tables they read from. An attribute type can contain `Nullable(...)` verbatim, or you can set `nullable = true`: both forms are equal.
 
-Known limitations:
+A change of any attribute except `database`, `name` and `cluster_name` is applied in place with `CREATE OR REPLACE DICTIONARY`.
 
-- Schema changes are currently applied as drop-and-recreate operations.
+ClickHouse reports `PASSWORD '[HIDDEN]'` in the `SOURCE` clause. The provider compares `source` with the password value masked and keeps the configured text in state, so a change of only the password is not detected.
+
+When the provider sets `fanout_cluster`, the resource acts on every node of that cluster and never uses `ON CLUSTER`:
+
+- Create and update make every node hold the configured definition. A missing dictionary is created. A dictionary that differs is replaced in place with `CREATE OR REPLACE DICTIONARY`.
+- Read queries every node. The `nodes` attribute lists the hosts that have the dictionary. When a node is missing the dictionary, or a node joins the cluster later, the plan shows an in-place update of `nodes` and the apply creates the dictionary there. When one node holds a different definition, the plan shows that difference.
+- Delete drops the dictionary on every node with `DROP ... IF EXISTS ... SYNC`.
+- `cluster_name` cannot be set together with `fanout_cluster`.
+
+Creating a dictionary that already exists on a node is an error, unless the provider sets `adopt_existing = true`. With adoption the existing dictionary is changed in place to match the configuration, or left alone when it already matches.
+
+SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in `SHOW CREATE`, because ClickHouse rewrites expressions into its canonical form.
 
 ## Example Usage
 
@@ -34,7 +49,7 @@ locals {
 }
 
 resource "clickhousedbops_table" "dictionary_source" {
-  database = "posthog"
+  database = "analytics"
   name     = "dictionary_source"
   engine   = "MergeTree()"
   order_by = "id"
@@ -42,11 +57,11 @@ resource "clickhousedbops_table" "dictionary_source" {
 }
 
 resource "clickhousedbops_dictionary" "teams" {
-  database    = "posthog"
+  database    = "analytics"
   name        = "teams"
   attributes  = local.dictionary_attributes
   primary_key = ["id"]
-  source      = "CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'posthog' TABLE 'dictionary_source')"
+  source      = "CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'analytics' TABLE 'dictionary_source')"
   layout      = "FLAT()"
   lifetime    = "0"
 }
@@ -63,18 +78,20 @@ resource "clickhousedbops_dictionary" "teams" {
 - `lifetime` (String) Raw LIFETIME clause body, for example 0 or MIN 0 MAX 300
 - `name` (String) Dictionary name
 - `primary_key` (List of String) Ordered list of attribute names used in the PRIMARY KEY clause
-- `source` (String) Raw SOURCE clause body, for example CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'posthog' TABLE 'teams_source') or NULL()
+- `source` (String) Raw SOURCE clause body, for example CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'analytics' TABLE 'teams_source') or NULL(). ClickHouse hides the PASSWORD value when it reports the dictionary, so a change of only the password is not detected.
 
 ### Optional
 
-- `cluster_name` (String) Name of the cluster to create the dictionary into. If omitted, the DDL runs only on the connected replica.
+- `cluster_name` (String) Name of the cluster to create the dictionary into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.
 - `comment` (String) Comment associated with the dictionary
+- `range` (String) Raw RANGE clause body for range dictionaries, for example MIN start_date MAX end_date
 - `settings` (String) Raw SETTINGS clause body
 
 ### Read-Only
 
 - `create_statement` (String) Canonical CREATE statement reported by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.dictionary or database.dictionary
+- `nodes` (List of String) Hosts where the dictionary exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified object name in the form database.dictionary
 
 <a id="nestedatt--attributes"></a>
@@ -83,8 +100,7 @@ resource "clickhousedbops_dictionary" "teams" {
 Required:
 
 - `name` (String) Attribute name
-- `nullable` (Boolean) Whether the provider should wrap the attribute type in Nullable(...)
-- `type` (String) Attribute type definition without the Nullable wrapper
+- `type` (String) Attribute type definition. It can contain Nullable(...) verbatim, or leave it out and set nullable instead.
 
 Optional:
 
@@ -93,3 +109,4 @@ Optional:
 - `hierarchical` (Boolean) Whether to append the HIERARCHICAL modifier
 - `injective` (Boolean) Whether to append the INJECTIVE modifier
 - `is_object_id` (Boolean) Whether to append the IS_OBJECT_ID modifier
+- `nullable` (Boolean) Whether the provider should wrap the attribute type in Nullable(...). Defaults to false.

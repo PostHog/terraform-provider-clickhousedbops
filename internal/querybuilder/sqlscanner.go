@@ -1,6 +1,9 @@
 package querybuilder
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // SQLScanState tracks delimiter nesting while scanning raw SQL character by character.
 // It handles parentheses, brackets, braces, and quoted strings (single, double, backtick).
@@ -84,4 +87,45 @@ func AdvanceSQLScanState(raw string, index int, state *SQLScanState) (int, error
 	}
 
 	return index, nil
+}
+
+// NormalizeSQL returns a whitespace-insensitive form of a SQL fragment for comparison.
+// Outside quotes it collapses whitespace runs to one space, removes whitespace after
+// ( and [ and before ) ] and , and puts exactly one space after every comma.
+// Quoted text is never changed.
+func NormalizeSQL(raw string) string {
+	var out strings.Builder
+	state := SQLScanState{}
+	pendingSpace := false
+	last := byte(0)
+	for index := 0; index < len(raw); index++ {
+		ch := raw[index]
+		inQuote := state.InQuote != 0
+		if !inQuote {
+			switch ch {
+			case ' ', '\t', '\n', '\r':
+				pendingSpace = true
+				continue
+			case ')', ']', ',':
+				pendingSpace = false
+			}
+			if pendingSpace && last != 0 && last != '(' && last != '[' {
+				out.WriteByte(' ')
+			}
+			pendingSpace = false
+		}
+
+		next, err := AdvanceSQLScanState(raw, index, &state)
+		if err != nil {
+			return strings.TrimSpace(raw)
+		}
+		out.WriteString(raw[index : next+1])
+		index = next
+		last = ch
+		if !inQuote && ch == ',' {
+			pendingSpace = true
+		}
+	}
+
+	return out.String()
 }

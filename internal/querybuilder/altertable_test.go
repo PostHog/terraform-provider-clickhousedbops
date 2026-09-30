@@ -97,7 +97,7 @@ func Test_BuildDropColumnAction(t *testing.T) {
 		{
 			name:   "Basic drop",
 			column: "col1",
-			want:   "DROP COLUMN `col1`",
+			want:   "DROP COLUMN IF EXISTS `col1`",
 		},
 		{
 			name:    "Empty name",
@@ -475,7 +475,7 @@ func Test_BuildAlterTable_ValidActions(t *testing.T) {
 			db:      "db1",
 			table:   "tbl1",
 			actions: []string{"DROP COLUMN `col1`"},
-			want:    "ALTER TABLE `db1`.`tbl1` DROP COLUMN `col1`;",
+			want:    "ALTER TABLE `db1`.`tbl1` DROP COLUMN `col1` SETTINGS alter_sync = 2;",
 		},
 		{
 			name:    "Multiple actions with cluster",
@@ -483,7 +483,7 @@ func Test_BuildAlterTable_ValidActions(t *testing.T) {
 			table:   "tbl1",
 			cluster: &cluster,
 			actions: []string{"DROP COLUMN `col1`", "DROP COLUMN `col2`"},
-			want:    "ALTER TABLE `db1`.`tbl1` ON CLUSTER 'cluster1' DROP COLUMN `col1`, DROP COLUMN `col2`;",
+			want:    "ALTER TABLE `db1`.`tbl1` ON CLUSTER 'cluster1' DROP COLUMN `col1`, DROP COLUMN `col2` SETTINGS alter_sync = 2;",
 		},
 		{
 			name:    "Empty database",

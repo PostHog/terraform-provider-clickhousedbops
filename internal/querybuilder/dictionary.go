@@ -22,11 +22,13 @@ type CreateDictionaryQuery struct {
 	Database    string
 	Name        string
 	ClusterName *string
+	OrReplace   bool
 	Attributes  []DictionaryAttributeDefinition
 	PrimaryKey  []string
 	Source      string
 	Layout      string
 	Lifetime    string
+	Range       string
 	Settings    string
 	Comment     string
 }
@@ -64,11 +66,11 @@ func (q CreateDictionaryQuery) Build() (string, error) {
 		return "", err
 	}
 
-	tokens := []string{
-		"CREATE",
-		"DICTIONARY",
-		qualifiedIdentifier(q.Database, q.Name),
+	tokens := []string{"CREATE"}
+	if q.OrReplace {
+		tokens = append(tokens, "OR REPLACE")
 	}
+	tokens = append(tokens, "DICTIONARY", qualifiedIdentifier(q.Database, q.Name))
 	tokens = appendClusterClause(tokens, q.ClusterName)
 
 	tokens = append(tokens,
@@ -79,6 +81,9 @@ func (q CreateDictionaryQuery) Build() (string, error) {
 		fmt.Sprintf("LAYOUT(%s)", strings.TrimSpace(q.Layout)),
 		fmt.Sprintf("LIFETIME(%s)", strings.TrimSpace(q.Lifetime)),
 	)
+	if strings.TrimSpace(q.Range) != "" {
+		tokens = append(tokens, fmt.Sprintf("RANGE(%s)", strings.TrimSpace(q.Range)))
+	}
 
 	if strings.TrimSpace(q.Settings) != "" {
 		tokens = append(tokens, "SETTINGS", strings.TrimSpace(q.Settings))

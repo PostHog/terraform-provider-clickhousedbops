@@ -5,20 +5,22 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"reflect"
+	"regexp"
+	"slices"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/querybuilder"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/schemahelpers"
 )
 
@@ -28,6 +30,7 @@ var dictionaryResourceDescription string
 var (
 	_ resource.Resource                = &Resource{}
 	_ resource.ResourceWithConfigure   = &Resource{}
+	_ resource.ResourceWithModifyPlan  = &Resource{}
 	_ resource.ResourceWithImportState = &Resource{}
 )
 
@@ -57,62 +60,59 @@ func (r *Resource) Metadata(_ context.Context, req resource.MetadataRequest, res
 func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	attrs := schemahelpers.CommonSchemaAttributes("dictionary")
 	attrs["attributes"] = schema.ListNestedAttribute{
-				Required:    true,
-				Description: "Dictionary attributes, including key columns referenced by primary_key. This can be assigned directly from a local list of objects.",
-				Validators: []validator.List{
-					listvalidator.SizeAtLeast(1),
-				},
-				PlanModifiers: []planmodifier.List{
-					listplanmodifier.RequiresReplace(),
-				},
-				NestedObject: schema.NestedAttributeObject{
-					Attributes: map[string]schema.Attribute{
-						"name": schema.StringAttribute{
-							Required:    true,
-							Description: "Attribute name",
-							Validators: []validator.String{
-								stringvalidator.LengthAtLeast(1),
-							},
-						},
-						"type": schema.StringAttribute{
-							Required:    true,
-							Description: "Attribute type definition without the Nullable wrapper",
-							Validators: []validator.String{
-								stringvalidator.LengthAtLeast(1),
-							},
-						},
-						"nullable": schema.BoolAttribute{
-							Required:    true,
-							Description: "Whether the provider should wrap the attribute type in Nullable(...)",
-						},
-						"default_expression": schema.StringAttribute{
-							Optional:    true,
-							Description: "Raw SQL expression to use in a DEFAULT clause",
-							Validators: []validator.String{
-								stringvalidator.LengthAtLeast(1),
-							},
-						},
-						"expression": schema.StringAttribute{
-							Optional:    true,
-							Description: "Raw SQL expression to use in an EXPRESSION clause",
-							Validators: []validator.String{
-								stringvalidator.LengthAtLeast(1),
-							},
-						},
-						"hierarchical": schema.BoolAttribute{
-							Optional:    true,
-							Description: "Whether to append the HIERARCHICAL modifier",
-						},
-						"injective": schema.BoolAttribute{
-							Optional:    true,
-							Description: "Whether to append the INJECTIVE modifier",
-						},
-						"is_object_id": schema.BoolAttribute{
-							Optional:    true,
-							Description: "Whether to append the IS_OBJECT_ID modifier",
-						},
+		Required:    true,
+		Description: "Dictionary attributes, including key columns referenced by primary_key. This can be assigned directly from a local list of objects.",
+		Validators: []validator.List{
+			listvalidator.SizeAtLeast(1),
+		},
+		NestedObject: schema.NestedAttributeObject{
+			Attributes: map[string]schema.Attribute{
+				"name": schema.StringAttribute{
+					Required:    true,
+					Description: "Attribute name",
+					Validators: []validator.String{
+						stringvalidator.LengthAtLeast(1),
 					},
 				},
+				"type": schema.StringAttribute{
+					Required:    true,
+					Description: "Attribute type definition. It can contain Nullable(...) verbatim, or leave it out and set nullable instead.",
+					Validators: []validator.String{
+						stringvalidator.LengthAtLeast(1),
+					},
+				},
+				"nullable": schema.BoolAttribute{
+					Optional:    true,
+					Description: "Whether the provider should wrap the attribute type in Nullable(...). Defaults to false.",
+				},
+				"default_expression": schema.StringAttribute{
+					Optional:    true,
+					Description: "Raw SQL expression to use in a DEFAULT clause",
+					Validators: []validator.String{
+						stringvalidator.LengthAtLeast(1),
+					},
+				},
+				"expression": schema.StringAttribute{
+					Optional:    true,
+					Description: "Raw SQL expression to use in an EXPRESSION clause",
+					Validators: []validator.String{
+						stringvalidator.LengthAtLeast(1),
+					},
+				},
+				"hierarchical": schema.BoolAttribute{
+					Optional:    true,
+					Description: "Whether to append the HIERARCHICAL modifier",
+				},
+				"injective": schema.BoolAttribute{
+					Optional:    true,
+					Description: "Whether to append the INJECTIVE modifier",
+				},
+				"is_object_id": schema.BoolAttribute{
+					Optional:    true,
+					Description: "Whether to append the IS_OBJECT_ID modifier",
+				},
+			},
+		},
 	}
 	attrs["primary_key"] = schema.ListAttribute{
 		Required:    true,
@@ -121,18 +121,12 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		Validators: []validator.List{
 			listvalidator.SizeAtLeast(1),
 		},
-		PlanModifiers: []planmodifier.List{
-			listplanmodifier.RequiresReplace(),
-		},
 	}
 	attrs["source"] = schema.StringAttribute{
 		Required:    true,
-		Description: "Raw SOURCE clause body, for example CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'posthog' TABLE 'teams_source') or NULL()",
+		Description: "Raw SOURCE clause body, for example CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'analytics' TABLE 'teams_source') or NULL(). ClickHouse hides the PASSWORD value when it reports the dictionary, so a change of only the password is not detected.",
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
-		},
-		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
 		},
 	}
 	attrs["layout"] = schema.StringAttribute{
@@ -141,9 +135,6 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
 		},
-		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
-		},
 	}
 	attrs["lifetime"] = schema.StringAttribute{
 		Required:    true,
@@ -151,8 +142,12 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
 		},
-		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
+	}
+	attrs["range"] = schema.StringAttribute{
+		Optional:    true,
+		Description: "Raw RANGE clause body for range dictionaries, for example MIN start_date MAX end_date",
+		Validators: []validator.String{
+			stringvalidator.LengthAtLeast(1),
 		},
 	}
 	attrs["settings"] = schema.StringAttribute{
@@ -161,18 +156,12 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
 		},
-		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
-		},
 	}
 	attrs["comment"] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Comment associated with the dictionary",
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
-		},
-		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
 		},
 	}
 	resp.Schema = schema.Schema{
@@ -189,6 +178,20 @@ func (r *Resource) Configure(_ context.Context, req resource.ConfigureRequest, _
 	r.client = req.ProviderData.(dbops.Client)
 }
 
+func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() || r.client == nil {
+		return
+	}
+
+	var clusterName types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("cluster_name"), &clusterName)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, clusterName, &resp.Plan)...)
+}
+
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan DictionaryResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -196,7 +199,7 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		return
 	}
 
-	state, diags := r.createDictionary(ctx, plan)
+	state, diags := r.convergeDictionary(ctx, plan, r.client.AdoptExisting())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -212,31 +215,40 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	dictionary, err := r.client.GetDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
-	if err != nil {
-		resp.Diagnostics.AddError("Error reading dictionary", fmt.Sprintf("%+v\n", err))
+	newState, dictionary, nodes, diags := schemahelpers.ReadNodes(ctx, r.client, state,
+		func(ctx context.Context, client dbops.Client) (*dbops.Dictionary, error) {
+			return client.GetDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+		},
+		syncDictionaryState,
+	)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-
-	if dictionary == nil {
+	if newState == nil {
 		resp.State.RemoveResource(ctx)
 		return
 	}
 
-	resp.Diagnostics.Append(syncDictionaryState(ctx, &state, dictionary)...)
+	newState.Nodes = nodes
+	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, dictionary.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
+	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
+}
+
+func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan DictionaryResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, dictionary.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
-	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-}
+	state, diags := r.convergeDictionary(ctx, plan, true)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
-func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError(
-		"Unexpected in-place dictionary update",
-		"Dictionaries are replacement-only resources. Terraform should plan a replacement instead of calling Update.",
-	)
+	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
 func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -246,58 +258,99 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 
-	if err := r.client.DeleteDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer()); err != nil {
-		resp.Diagnostics.AddError("Error deleting dictionary", fmt.Sprintf("%+v\n", err))
-	}
+	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
+		return client.DeleteDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	})...)
 }
 
 func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	schemahelpers.ImportSchemaObjectState(ctx, req, resp)
 }
 
-func (r *Resource) createDictionary(ctx context.Context, plan DictionaryResourceModel) (*DictionaryResourceModel, diag.Diagnostics) {
+// convergeDictionary makes every node hold the planned dictionary. A dictionary that
+// differs is replaced in place with CREATE OR REPLACE DICTIONARY.
+func (r *Resource) convergeDictionary(ctx context.Context, plan DictionaryResourceModel, adopt bool) (*DictionaryResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
-	dictionary, err := expandDictionaryModel(ctx, plan)
+	desired, err := expandDictionaryModel(ctx, plan)
 	diags.Append(schemahelpers.DiagnosticsFromErr("Invalid dictionary configuration", err)...)
 	if diags.HasError() {
 		return nil, diags
 	}
 
-	createdDictionary, err := r.client.CreateDictionary(ctx, dictionary, plan.ClusterName.ValueStringPointer())
-	diags.Append(schemahelpers.DiagnosticsFromErr("Error creating dictionary", err)...)
+	clusterName := plan.ClusterName.ValueStringPointer()
+	dictionary, nodes, convergeDiags := schemahelpers.ConvergeNodes(ctx, r.client, adopt, schemahelpers.NodeConverger[dbops.Dictionary]{
+		Kind:          "dictionary",
+		QualifiedName: schemahelpers.QualifiedName(desired.Database, desired.Name),
+		Get: func(ctx context.Context, client dbops.Client) (*dbops.Dictionary, error) {
+			return client.GetDictionary(ctx, desired.Database, desired.Name, clusterName)
+		},
+		Create: func(ctx context.Context, client dbops.Client, _ *dbops.Dictionary) error {
+			_, err := client.CreateDictionary(ctx, desired, clusterName)
+			return err
+		},
+		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.Dictionary) error {
+			candidate := plan
+			if syncDiags := syncDictionaryState(ctx, &candidate, existing); syncDiags.HasError() {
+				return schemahelpers.DiagnosticsError(syncDiags)
+			}
+			if reflect.DeepEqual(candidate, plan) {
+				return nil
+			}
+			_, err := node.Client.ReplaceDictionary(ctx, desired, clusterName)
+			return err
+		},
+	})
+	diags.Append(convergeDiags...)
 	if diags.HasError() {
-		return nil, diags
-	}
-	if createdDictionary == nil {
-		diags.AddError("Error creating dictionary", "ClickHouse returned no metadata for the created dictionary.")
 		return nil, diags
 	}
 
 	state := plan
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, createdDictionary.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
+	state.Nodes = nodes
+	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, dictionary.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
 
 	return &state, diags
+}
+
+var sourcePasswordPattern = regexp.MustCompile(`(?i)\bPASSWORD\s+'(?:[^'\\]|\\.|'')*'`)
+
+// sourcesEqual compares two SOURCE clause bodies with the password value masked, because
+// ClickHouse reports PASSWORD '[HIDDEN]'.
+func sourcesEqual(left string, right string) bool {
+	mask := func(source string) string {
+		return sourcePasswordPattern.ReplaceAllString(querybuilder.NormalizeSQL(source), "PASSWORD '[HIDDEN]'")
+	}
+	return mask(left) == mask(right)
 }
 
 func syncDictionaryState(ctx context.Context, state *DictionaryResourceModel, dict *dbops.Dictionary) diag.Diagnostics {
 	var diags diag.Diagnostics
 
 	state.Comment = schemahelpers.SyncOptionalString(state.Comment, dict.Comment)
-	state.Source = schemahelpers.SyncOptionalString(state.Source, dict.Source)
-	state.Layout = schemahelpers.SyncOptionalString(state.Layout, dict.Layout)
-	state.Lifetime = schemahelpers.SyncOptionalString(state.Lifetime, dict.Lifetime)
-	state.Settings = schemahelpers.SyncOptionalString(state.Settings, dict.Settings)
+	if state.Source.IsNull() || state.Source.IsUnknown() || !sourcesEqual(state.Source.ValueString(), dict.Source) {
+		state.Source = schemahelpers.SyncOptionalString(state.Source, dict.Source)
+	}
+	state.Layout = schemahelpers.SyncEquivalentString(state.Layout, dict.Layout)
+	state.Lifetime = schemahelpers.SyncEquivalentString(state.Lifetime, dict.Lifetime)
+	state.Range = schemahelpers.SyncEquivalentString(state.Range, dict.Range)
+	state.Settings = schemahelpers.SyncEquivalentString(state.Settings, dict.Settings)
+
+	// The configured attributes and primary key stay in state when they are equivalent to
+	// the remote ones, so that formatting differences are not drift.
+	if current, err := expandDictionaryModel(ctx, *state); err == nil && attributesEqual(current.Attributes, dict.Attributes) && slices.Equal(current.PrimaryKey, dict.PrimaryKey) {
+		return diags
+	}
 
 	attrModels := make([]attributeModel, 0, len(dict.Attributes))
 	for _, attr := range dict.Attributes {
 		model := attributeModel{
 			Name:         types.StringValue(attr.Name),
 			Type:         types.StringValue(attr.Type),
-			Nullable:     types.BoolValue(attr.Nullable),
-			Hierarchical: types.BoolValue(attr.Hierarchical),
-			Injective:    types.BoolValue(attr.Injective),
-			IsObjectID:   types.BoolValue(attr.IsObjectID),
+			Nullable:     types.BoolNull(),
+			Hierarchical: trueOrNull(attr.Hierarchical),
+			Injective:    trueOrNull(attr.Injective),
+			IsObjectID:   trueOrNull(attr.IsObjectID),
 		}
 		if attr.DefaultExpression != nil {
 			model.DefaultExpression = types.StringValue(*attr.DefaultExpression)
@@ -327,6 +380,25 @@ func syncDictionaryState(ctx context.Context, state *DictionaryResourceModel, di
 	state.PrimaryKey = pkList
 
 	return diags
+}
+
+// trueOrNull is null for an unset flag: the flags are optional, and a configuration
+// normally leaves them out.
+func trueOrNull(value bool) types.Bool {
+	if value {
+		return types.BoolValue(true)
+	}
+	return types.BoolNull()
+}
+
+func attributesEqual(left []dbops.DictionaryAttribute, right []dbops.DictionaryAttribute) bool {
+	return slices.EqualFunc(left, right, func(a dbops.DictionaryAttribute, b dbops.DictionaryAttribute) bool {
+		return a.Name == b.Name &&
+			schemahelpers.TypesEqual(a.Type, a.Nullable, b.Type, b.Nullable) &&
+			schemahelpers.OptionalStringsEqual(a.DefaultExpression, b.DefaultExpression) &&
+			schemahelpers.OptionalStringsEqual(a.Expression, b.Expression) &&
+			a.Hierarchical == b.Hierarchical && a.Injective == b.Injective && a.IsObjectID == b.IsObjectID
+	})
 }
 
 func dictionaryAttributeObjectType() types.ObjectType {
@@ -404,6 +476,7 @@ func expandDictionaryModel(ctx context.Context, plan DictionaryResourceModel) (d
 		Source:     plan.Source.ValueString(),
 		Layout:     plan.Layout.ValueString(),
 		Lifetime:   plan.Lifetime.ValueString(),
+		Range:      plan.Range.ValueString(),
 		Settings:   plan.Settings.ValueString(),
 		Comment:    plan.Comment.ValueString(),
 	}, nil

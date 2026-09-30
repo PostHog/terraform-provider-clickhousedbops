@@ -67,12 +67,12 @@ func TestUnwrapNullableType(t *testing.T) {
 }
 
 func TestParseCreateViewDefinition(t *testing.T) {
-	definition, err := parseCreateViewDefinition("CREATE VIEW `posthog`.`team_event_counts` (`team_id` UInt64, `event_count` Nullable(UInt64)) AS SELECT team_id, count() AS event_count FROM posthog.events GROUP BY team_id")
+	definition, err := parseCreateViewDefinition("CREATE VIEW `analytics`.`team_event_counts` (`team_id` UInt64, `event_count` Nullable(UInt64)) AS SELECT team_id, count() AS event_count FROM analytics.events GROUP BY team_id")
 	if err != nil {
 		t.Fatalf("parseCreateViewDefinition() error = %v", err)
 	}
 
-	if definition.Query != "SELECT team_id, count() AS event_count FROM posthog.events GROUP BY team_id" {
+	if definition.Query != "SELECT team_id, count() AS event_count FROM analytics.events GROUP BY team_id" {
 		t.Fatalf("unexpected query: %q", definition.Query)
 	}
 	if len(definition.Columns) != 2 {
@@ -81,39 +81,22 @@ func TestParseCreateViewDefinition(t *testing.T) {
 	if definition.Columns[0] != (Column{Name: "team_id", Type: "UInt64", Nullable: false}) {
 		t.Fatalf("unexpected first column: %#v", definition.Columns[0])
 	}
-	if definition.Columns[1] != (Column{Name: "event_count", Type: "UInt64", Nullable: true}) {
+	if definition.Columns[1] != (Column{Name: "event_count", Type: "Nullable(UInt64)"}) {
 		t.Fatalf("unexpected second column: %#v", definition.Columns[1])
 	}
 }
 
 func TestParseCreateViewDefinitionWithoutSignature(t *testing.T) {
-	definition, err := parseCreateViewDefinition("CREATE VIEW `posthog`.`team_event_counts` AS SELECT team_id FROM posthog.events")
+	definition, err := parseCreateViewDefinition("CREATE VIEW `analytics`.`team_event_counts` AS SELECT team_id FROM analytics.events")
 	if err != nil {
 		t.Fatalf("parseCreateViewDefinition() error = %v", err)
 	}
 
-	if definition.Query != "SELECT team_id FROM posthog.events" {
+	if definition.Query != "SELECT team_id FROM analytics.events" {
 		t.Fatalf("unexpected query: %q", definition.Query)
 	}
 	if len(definition.Columns) != 0 {
 		t.Fatalf("expected no explicit columns, got %#v", definition.Columns)
-	}
-}
-
-func TestTableColumnKeyStableForDuplicateClusterRows(t *testing.T) {
-	left := Column{
-		Name:     "id",
-		Type:     "UInt64",
-		Nullable: false,
-	}
-	right := Column{
-		Name:     "id",
-		Type:     "UInt64",
-		Nullable: false,
-	}
-
-	if tableColumnKey(left) != tableColumnKey(right) {
-		t.Fatalf("expected identical columns to produce the same dedupe key")
 	}
 }
 
@@ -314,7 +297,7 @@ func TestParseCreateMaterializedViewDefinition_ToColumnsAndPopulate(t *testing.T
 	if definition.ToColumns[0] != (Column{Name: "user_id", Type: "UInt64", Nullable: false}) {
 		t.Fatalf("unexpected first to_column: %#v", definition.ToColumns[0])
 	}
-	if definition.ToColumns[1] != (Column{Name: "name", Type: "String", Nullable: true}) {
+	if definition.ToColumns[1] != (Column{Name: "name", Type: "Nullable(String)"}) {
 		t.Fatalf("unexpected second to_column: %#v", definition.ToColumns[1])
 	}
 
@@ -331,5 +314,86 @@ func TestParseCreateMaterializedViewDefinition_ToColumnsAndPopulate(t *testing.T
 	}
 	if definition.OrderBy != "id" {
 		t.Fatalf("unexpected order_by: %q", definition.OrderBy)
+	}
+}
+
+func TestParseCreateTableElements(t *testing.T) {
+	ptr := func(s string) *string { return &s }
+
+	elements, err := parseCreateTableElements("CREATE TABLE db.t UUID '2e2f3729-298d-4675-b7aa-3568efcdddef' (" +
+		"`id` UInt64, " +
+		"`s` Nullable(String) DEFAULT 'x' COMMENT 'it\\'s a TTL, DEFAULT (note)' CODEC(Delta(8), ZSTD(1)) TTL ts + toIntervalDay(1), " +
+		"`e` Enum8('DEFAULT' = 1, 'ALIAS' = 2), " +
+		"`j` JSON(max_dynamic_paths = 0), " +
+		"`tup` Tuple(a String, b UInt64), " +
+		"`agg` AggregateFunction(argMax, String, DateTime64(6)), " +
+		"`m` String MATERIALIZED upper(s), " +
+		"`a` String ALIAS concat(s, ' CODEC(x) '), " +
+		"`eph` Map(String, String) EPHEMERAL CAST(JSONExtractKeysAndValues(s, 'String'), 'Map(String, String)'), " +
+		"`bare` String EPHEMERAL, " +
+		"unquoted DateTime CODEC(ZSTD(3)), " +
+		"INDEX i1 s TYPE bloom_filter(0.01) GRANULARITY 2, " +
+		"INDEX `i 2` (id, s) TYPE minmax, " +
+		"CONSTRAINT c1 CHECK (id > 0) AND (s != 'CHECK'), " +
+		"PROJECTION p1 (SELECT id, count() GROUP BY id)" +
+		") ENGINE = MergeTree ORDER BY (id, s) SETTINGS index_granularity = 8192")
+	if err != nil {
+		t.Fatalf("parseCreateTableElements() error = %v", err)
+	}
+
+	wantColumns := []Column{
+		{Name: "id", Type: "UInt64"},
+		{Name: "s", Type: "Nullable(String)", DefaultExpression: ptr("'x'"), Comment: "it's a TTL, DEFAULT (note)", Codec: "Delta(8), ZSTD(1)", TTL: "ts + toIntervalDay(1)"},
+		{Name: "e", Type: "Enum8('DEFAULT' = 1, 'ALIAS' = 2)"},
+		{Name: "j", Type: "JSON(max_dynamic_paths = 0)"},
+		{Name: "tup", Type: "Tuple(a String, b UInt64)"},
+		{Name: "agg", Type: "AggregateFunction(argMax, String, DateTime64(6))"},
+		{Name: "m", Type: "String", MaterializedExpression: ptr("upper(s)")},
+		{Name: "a", Type: "String", AliasExpression: ptr("concat(s, ' CODEC(x) ')")},
+		{Name: "eph", Type: "Map(String, String)", EphemeralExpression: ptr("CAST(JSONExtractKeysAndValues(s, 'String'), 'Map(String, String)')")},
+		{Name: "bare", Type: "String EPHEMERAL"},
+		{Name: "unquoted", Type: "DateTime", Codec: "ZSTD(3)"},
+	}
+	if len(elements.Columns) != len(wantColumns) {
+		t.Fatalf("expected %d columns, got %#v", len(wantColumns), elements.Columns)
+	}
+	deref := func(s *string) string {
+		if s == nil {
+			return "<nil>"
+		}
+		return *s
+	}
+	for i, want := range wantColumns {
+		got := elements.Columns[i]
+		if got.Name != want.Name || got.Type != want.Type || got.Nullable || got.Comment != want.Comment || got.Codec != want.Codec || got.TTL != want.TTL ||
+			deref(got.DefaultExpression) != deref(want.DefaultExpression) || deref(got.MaterializedExpression) != deref(want.MaterializedExpression) ||
+			deref(got.AliasExpression) != deref(want.AliasExpression) || deref(got.EphemeralExpression) != deref(want.EphemeralExpression) {
+			t.Errorf("column %d = %#v, want %#v", i, got, want)
+		}
+	}
+
+	wantIndexes := []Index{
+		{Name: "i1", Expression: "s", Type: "bloom_filter(0.01)", Granularity: 2},
+		{Name: "i 2", Expression: "(id, s)", Type: "minmax", Granularity: 1},
+	}
+	if len(elements.Indexes) != 2 || elements.Indexes[0] != wantIndexes[0] || elements.Indexes[1] != wantIndexes[1] {
+		t.Errorf("indexes = %#v, want %#v", elements.Indexes, wantIndexes)
+	}
+	if len(elements.Constraints) != 1 || elements.Constraints[0] != (Constraint{Name: "c1", Check: "(id > 0) AND (s != 'CHECK')"}) {
+		t.Errorf("unexpected constraints: %#v", elements.Constraints)
+	}
+	if len(elements.Projections) != 1 || elements.Projections[0] != (Projection{Name: "p1", Query: "SELECT id, count() GROUP BY id"}) {
+		t.Errorf("unexpected projections: %#v", elements.Projections)
+	}
+}
+
+func TestParseCreateMaterializedViewDefinition_EngineBackedColumnDefinitions(t *testing.T) {
+	definition, err := parseCreateMaterializedViewDefinition("CREATE MATERIALIZED VIEW db.mv (`id` UInt64 CODEC(ZSTD(1)), `s` Nullable(String) DEFAULT 'x') ENGINE = MergeTree ORDER BY id AS SELECT id, s FROM db.t")
+	if err != nil {
+		t.Fatalf("parseCreateMaterializedViewDefinition() error = %v", err)
+	}
+	if len(definition.Columns) != 2 || definition.Columns[0].Codec != "ZSTD(1)" || definition.Columns[1].Type != "Nullable(String)" ||
+		definition.Columns[1].DefaultExpression == nil || *definition.Columns[1].DefaultExpression != "'x'" {
+		t.Fatalf("unexpected columns: %#v", definition.Columns)
 	}
 }

@@ -23,6 +23,8 @@ type TableSettingCapability struct {
 	Name     string
 	Known    bool
 	Readonly bool
+	// Default is the value that the server gives to a table that does not set the setting.
+	Default string
 }
 
 func (i *impl) GetTableEngineCapabilities(ctx context.Context, engine string) (TableEngineCapabilities, error) {
@@ -97,6 +99,7 @@ func (i *impl) GetTableSettingCapabilities(ctx context.Context, engine string, s
 			[]querybuilder.Field{
 				querybuilder.NewField("name"),
 				querybuilder.NewField("readonly"),
+				querybuilder.NewField("value"),
 			},
 			tableName,
 		).Where(querybuilder.WhereIn("name", settingNames)).Build()
@@ -114,10 +117,16 @@ func (i *impl) GetTableSettingCapabilities(ctx context.Context, engine string, s
 				return rowErr
 			}
 
+			value, rowErr := data.GetString("value")
+			if rowErr != nil {
+				return rowErr
+			}
+
 			capabilities[name] = TableSettingCapability{
 				Name:     name,
 				Known:    true,
 				Readonly: readonly,
+				Default:  value,
 			}
 			return nil
 		})

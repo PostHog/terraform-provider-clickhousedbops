@@ -15,6 +15,27 @@ type ColumnDefinition struct {
 	DefaultExpression      *string
 	MaterializedExpression *string
 	AliasExpression        *string
+	EphemeralExpression    *string
+	Codec                  string
+	TTL                    string
+}
+
+type IndexDefinition struct {
+	Name        string
+	Expression  string
+	Type        string
+	Granularity int64
+}
+
+type ProjectionDefinition struct {
+	Name     string
+	Query    string
+	Settings string
+}
+
+type ConstraintDefinition struct {
+	Name  string
+	Check string
 }
 
 type CreateTableQuery struct {
@@ -22,6 +43,9 @@ type CreateTableQuery struct {
 	Name        string
 	ClusterName *string
 	Columns     []ColumnDefinition
+	Indexes     []IndexDefinition
+	Projections []ProjectionDefinition
+	Constraints []ConstraintDefinition
 	Engine      string
 	PartitionBy string
 	OrderBy     string
@@ -36,6 +60,7 @@ type CreateViewQuery struct {
 	Database    string
 	Name        string
 	ClusterName *string
+	OrReplace   bool
 	Columns     []ColumnDefinition
 	Query       string
 }
@@ -83,6 +108,15 @@ func (q CreateTableQuery) Build() (string, error) {
 		if err != nil {
 			return "", err
 		}
+		for _, index := range q.Indexes {
+			definitions = append(definitions, index.SQL())
+		}
+		for _, projection := range q.Projections {
+			definitions = append(definitions, projection.SQL())
+		}
+		for _, constraint := range q.Constraints {
+			definitions = append(definitions, constraint.SQL())
+		}
 		tokens = append(tokens, fmt.Sprintf("(%s)", strings.Join(definitions, ", ")))
 	}
 
@@ -124,11 +158,11 @@ func (q CreateViewQuery) Build() (string, error) {
 		return "", errors.New("query cannot be empty for CREATE VIEW queries")
 	}
 
-	tokens := []string{
-		"CREATE",
-		"VIEW",
-		qualifiedIdentifier(q.Database, q.Name),
+	tokens := []string{"CREATE"}
+	if q.OrReplace {
+		tokens = append(tokens, "OR REPLACE")
 	}
+	tokens = append(tokens, "VIEW", qualifiedIdentifier(q.Database, q.Name))
 	tokens = appendClusterClause(tokens, q.ClusterName)
 	if len(q.Columns) > 0 {
 		signature, err := buildColumnSignatures(q.Columns)
@@ -260,14 +294,44 @@ func columnTypeSQL(column ColumnDefinition) (string, error) {
 }
 
 func typeSQL(rawType string, nullable bool, label string) (string, error) {
-	t := strings.TrimSpace(rawType)
+	t := EffectiveType(rawType, nullable)
 	if t == "" {
 		return "", fmt.Errorf("%s type cannot be empty", label)
 	}
 
-	if nullable {
-		return fmt.Sprintf("Nullable(%s)", t), nil
+	return t, nil
+}
+
+// EffectiveType returns the full type of a column: rawType wrapped in Nullable(...)
+// when nullable is set and rawType is not already a Nullable type.
+func EffectiveType(rawType string, nullable bool) string {
+	t := strings.TrimSpace(rawType)
+	if _, wrapped := UnwrapNullableType(t); nullable && !wrapped && t != "" {
+		return fmt.Sprintf("Nullable(%s)", t)
 	}
 
-	return t, nil
+	return t
+}
+
+// SQL returns the index definition as it appears in CREATE TABLE and ADD INDEX.
+func (d IndexDefinition) SQL() string {
+	granularity := d.Granularity
+	if granularity == 0 {
+		granularity = 1
+	}
+	return fmt.Sprintf("INDEX %s %s TYPE %s GRANULARITY %d", backtick(strings.TrimSpace(d.Name)), strings.TrimSpace(d.Expression), strings.TrimSpace(d.Type), granularity)
+}
+
+// SQL returns the projection definition as it appears in CREATE TABLE and ADD PROJECTION.
+func (d ProjectionDefinition) SQL() string {
+	sql := fmt.Sprintf("PROJECTION %s (%s)", backtick(strings.TrimSpace(d.Name)), strings.TrimSpace(d.Query))
+	if settings := strings.TrimSpace(d.Settings); settings != "" {
+		sql += fmt.Sprintf(" WITH SETTINGS (%s)", settings)
+	}
+	return sql
+}
+
+// SQL returns the constraint definition as it appears in CREATE TABLE and ADD CONSTRAINT.
+func (d ConstraintDefinition) SQL() string {
+	return fmt.Sprintf("CONSTRAINT %s CHECK %s", backtick(strings.TrimSpace(d.Name)), strings.TrimSpace(d.Check))
 }

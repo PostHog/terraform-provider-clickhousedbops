@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/querybuilder"
 )
 
 type ColumnModel struct {
@@ -30,6 +31,9 @@ type ColumnModel struct {
 	DefaultExpression      types.String `tfsdk:"default_expression"`
 	MaterializedExpression types.String `tfsdk:"materialized_expression"`
 	AliasExpression        types.String `tfsdk:"alias_expression"`
+	EphemeralExpression    types.String `tfsdk:"ephemeral_expression"`
+	Codec                  types.String `tfsdk:"codec"`
+	TTL                    types.String `tfsdk:"ttl"`
 }
 
 type ColumnSignatureModel struct {
@@ -76,6 +80,27 @@ func ColumnsAttributeWithPlanModifiers(description string, modifiers []planmodif
 	attributes["alias_expression"] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw SQL expression to use in an ALIAS clause",
+		Validators: []validator.String{
+			stringvalidator.LengthAtLeast(1),
+		},
+	}
+	attributes["ephemeral_expression"] = schema.StringAttribute{
+		Optional:    true,
+		Description: "Raw SQL expression to use in an EPHEMERAL clause",
+		Validators: []validator.String{
+			stringvalidator.LengthAtLeast(1),
+		},
+	}
+	attributes["codec"] = schema.StringAttribute{
+		Optional:    true,
+		Description: "Compression codecs: the text inside CODEC(...), for example ZSTD(3) or Delta(4), ZSTD(1)",
+		Validators: []validator.String{
+			stringvalidator.LengthAtLeast(1),
+		},
+	}
+	attributes["ttl"] = schema.StringAttribute{
+		Optional:    true,
+		Description: "Raw column TTL expression",
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
 		},
@@ -144,6 +169,12 @@ func ExpandColumns(ctx context.Context, columns types.List) ([]dbops.Column, dia
 			expr := model.AliasExpression.ValueString()
 			column.AliasExpression = &expr
 		}
+		if !model.EphemeralExpression.IsNull() {
+			expr := model.EphemeralExpression.ValueString()
+			column.EphemeralExpression = &expr
+		}
+		column.Codec = model.Codec.ValueString()
+		column.TTL = model.TTL.ValueString()
 
 		ret = append(ret, column)
 	}
@@ -186,7 +217,9 @@ func ColumnsValue(ctx context.Context, columns []dbops.Column) (types.List, diag
 		model := ColumnModel{
 			Name:     types.StringValue(column.Name),
 			Type:     types.StringValue(column.Type),
-			Nullable: types.BoolValue(column.Nullable),
+			Nullable: nullableValue(column.Nullable),
+			Codec:    SyncOptionalString(types.StringNull(), column.Codec),
+			TTL:      SyncOptionalString(types.StringNull(), column.TTL),
 		}
 
 		if strings.TrimSpace(column.Comment) != "" {
@@ -198,6 +231,7 @@ func ColumnsValue(ctx context.Context, columns []dbops.Column) (types.List, diag
 		model.DefaultExpression = optionalStringValue(column.DefaultExpression)
 		model.MaterializedExpression = optionalStringValue(column.MaterializedExpression)
 		model.AliasExpression = optionalStringValue(column.AliasExpression)
+		model.EphemeralExpression = optionalStringValue(column.EphemeralExpression)
 		models = append(models, model)
 	}
 
@@ -214,7 +248,7 @@ func ColumnSignaturesValue(ctx context.Context, columns []dbops.Column) (types.L
 		models = append(models, ColumnSignatureModel{
 			Name:     types.StringValue(column.Name),
 			Type:     types.StringValue(column.Type),
-			Nullable: types.BoolValue(column.Nullable),
+			Nullable: nullableValue(column.Nullable),
 		})
 	}
 
@@ -282,14 +316,14 @@ func columnSignatureAttributes() map[string]schema.Attribute {
 		},
 		"type": schema.StringAttribute{
 			Required:    true,
-			Description: "Column type definition without the Nullable wrapper",
+			Description: "Column type definition. It can contain Nullable(...) verbatim, or leave it out and set nullable instead.",
 			Validators: []validator.String{
 				stringvalidator.LengthAtLeast(1),
 			},
 		},
 		"nullable": schema.BoolAttribute{
-			Required:    true,
-			Description: "Whether the provider should wrap the column type in Nullable(...)",
+			Optional:    true,
+			Description: "Whether the provider should wrap the column type in Nullable(...). Defaults to false.",
 		},
 	}
 }
@@ -303,6 +337,9 @@ func columnObjectAttrTypes() map[string]attr.Type {
 		"default_expression":      types.StringType,
 		"materialized_expression": types.StringType,
 		"alias_expression":        types.StringType,
+		"ephemeral_expression":    types.StringType,
+		"codec":                   types.StringType,
+		"ttl":                     types.StringType,
 	}
 }
 
@@ -314,8 +351,19 @@ func columnSignatureObjectAttrTypes() map[string]attr.Type {
 	}
 }
 
-// OptionalStringsEqual compares two optional string pointers, treating nil and
-// empty/whitespace-only values as equivalent.
+// SQLEqual compares two SQL fragments ignoring whitespace differences outside quotes.
+func SQLEqual(left string, right string) bool {
+	return querybuilder.NormalizeSQL(left) == querybuilder.NormalizeSQL(right)
+}
+
+// TypesEqual compares the effective types of two columns, so that type "String" with
+// nullable set equals type "Nullable(String)".
+func TypesEqual(leftType string, leftNullable bool, rightType string, rightNullable bool) bool {
+	return SQLEqual(querybuilder.EffectiveType(leftType, leftNullable), querybuilder.EffectiveType(rightType, rightNullable))
+}
+
+// OptionalStringsEqual compares two optional SQL fragments ignoring whitespace differences.
+// A nil value and an empty value are equal only to themselves.
 func OptionalStringsEqual(a *string, b *string) bool {
 	if a == nil && b == nil {
 		return true
@@ -323,18 +371,20 @@ func OptionalStringsEqual(a *string, b *string) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return strings.TrimSpace(*a) == strings.TrimSpace(*b)
+	return SQLEqual(*a, *b)
 }
 
-// ColumnEqual compares two columns for equality, trimming whitespace in string fields.
+// ColumnEqual compares two columns for equality, ignoring whitespace differences in SQL fields.
 func ColumnEqual(left dbops.Column, right dbops.Column) bool {
 	return left.Name == right.Name &&
-		left.Nullable == right.Nullable &&
-		strings.TrimSpace(left.Type) == strings.TrimSpace(right.Type) &&
+		TypesEqual(left.Type, left.Nullable, right.Type, right.Nullable) &&
 		strings.TrimSpace(left.Comment) == strings.TrimSpace(right.Comment) &&
 		OptionalStringsEqual(left.DefaultExpression, right.DefaultExpression) &&
 		OptionalStringsEqual(left.MaterializedExpression, right.MaterializedExpression) &&
-		OptionalStringsEqual(left.AliasExpression, right.AliasExpression)
+		OptionalStringsEqual(left.AliasExpression, right.AliasExpression) &&
+		OptionalStringsEqual(left.EphemeralExpression, right.EphemeralExpression) &&
+		SQLEqual(left.Codec, right.Codec) &&
+		SQLEqual(left.TTL, right.TTL)
 }
 
 // ColumnsEqual compares two column slices for equality including all fields.
@@ -358,8 +408,7 @@ func ColumnSignaturesEqual(left []dbops.Column, right []dbops.Column) bool {
 	}
 	for i := range left {
 		if left[i].Name != right[i].Name ||
-			left[i].Nullable != right[i].Nullable ||
-			strings.TrimSpace(left[i].Type) != strings.TrimSpace(right[i].Type) {
+			!TypesEqual(left[i].Type, left[i].Nullable, right[i].Type, right[i].Nullable) {
 			return false
 		}
 	}
@@ -378,6 +427,24 @@ func SyncOptionalString(current types.String, remote string) types.String {
 	return types.StringValue(remote)
 }
 
+// SyncEquivalentString updates a Terraform string attribute from a remote SQL fragment.
+// It keeps the current text when that text is equivalent to the remote one.
+func SyncEquivalentString(current types.String, remote string) types.String {
+	if !current.IsNull() && !current.IsUnknown() && SQLEqual(current.ValueString(), remote) {
+		return current
+	}
+	return SyncOptionalString(current, remote)
+}
+
+// nullableValue is null for a column that is not nullable: nullable is optional and a
+// remote column always carries its full type.
+func nullableValue(nullable bool) types.Bool {
+	if nullable {
+		return types.BoolValue(true)
+	}
+	return types.BoolNull()
+}
+
 func optionalStringValue(value *string) types.String {
 	if value == nil || strings.TrimSpace(*value) == "" {
 		return types.StringNull()
@@ -391,7 +458,7 @@ func CommonSchemaAttributes(objectType string) map[string]schema.Attribute {
 	return map[string]schema.Attribute{
 		"cluster_name": schema.StringAttribute{
 			Optional:    true,
-			Description: fmt.Sprintf("Name of the cluster to create the %s into. If omitted, the DDL runs only on the connected replica.", objectType),
+			Description: fmt.Sprintf("Name of the cluster to create the %s into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.", objectType),
 			PlanModifiers: []planmodifier.String{
 				stringplanmodifier.RequiresReplace(),
 			},
@@ -409,6 +476,11 @@ func CommonSchemaAttributes(objectType string) map[string]schema.Attribute {
 			PlanModifiers: []planmodifier.String{
 				stringplanmodifier.UseStateForUnknown(),
 			},
+		},
+		"nodes": schema.ListAttribute{
+			Computed:    true,
+			ElementType: types.StringType,
+			Description: fmt.Sprintf("Hosts where the %s exists: every node of the provider's fanout_cluster, or the provider host.", objectType),
 		},
 		"create_statement": schema.StringAttribute{
 			Computed:    true,

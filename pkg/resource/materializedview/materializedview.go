@@ -3,10 +3,14 @@ package materializedview
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/resourcevalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -29,6 +33,7 @@ var (
 	_ resource.ResourceWithConfigure        = &Resource{}
 	_ resource.ResourceWithConfigValidators = &Resource{}
 	_ resource.ResourceWithValidateConfig   = &Resource{}
+	_ resource.ResourceWithModifyPlan       = &Resource{}
 	_ resource.ResourceWithImportState      = &Resource{}
 )
 
@@ -134,15 +139,12 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["to_columns"] = schemahelpers.ColumnSignaturesAttribute("Optional destination signature appended after TO <table> (...). Only name, type, and nullable are supported there.")
+	attrs["to_columns"] = schemahelpers.ColumnSignaturesAttribute("Optional destination signature appended after TO <table> (...). Only name, type, and nullable are supported there. When omitted, the column list that ClickHouse infers is not tracked.")
 	attrs["query"] = schema.StringAttribute{
 		Required:    true,
-		Description: "Raw SELECT query used by the materialized view definition",
+		Description: "Raw SELECT query used by the materialized view definition. With to_table a change is applied in place with ALTER TABLE ... MODIFY QUERY. With engine a change replaces the materialized view.",
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
-		},
-		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
 		},
 	}
 	resp.Schema = schema.Schema{
@@ -229,6 +231,31 @@ func (r *Resource) ValidateConfig(ctx context.Context, req resource.ValidateConf
 	}
 }
 
+func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() || r.client == nil {
+		return
+	}
+
+	var plan MaterializedViewResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, plan.ClusterName, &resp.Plan)...)
+	if resp.Diagnostics.HasError() || req.State.Raw.IsNull() {
+		return
+	}
+
+	// MODIFY QUERY works only for a materialized view that writes to a separate table, and
+	// the provider runs it per node, not ON CLUSTER.
+	var state MaterializedViewResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if (plan.ToTable.IsNull() || !plan.ClusterName.IsNull()) && !schemahelpers.SQLEqual(plan.Query.ValueString(), state.Query.ValueString()) {
+		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("query"))
+	}
+}
+
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan MaterializedViewResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -236,7 +263,7 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		return
 	}
 
-	state, diags := r.createMaterializedView(ctx, plan)
+	state, diags := r.convergeMaterializedView(ctx, plan, r.client.AdoptExisting())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -252,31 +279,40 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	view, err := r.client.GetMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
-	if err != nil {
-		resp.Diagnostics.AddError("Error reading materialized view", fmt.Sprintf("%+v\n", err))
+	newState, view, nodes, diags := schemahelpers.ReadNodes(ctx, r.client, state,
+		func(ctx context.Context, client dbops.Client) (*dbops.MaterializedView, error) {
+			return client.GetMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+		},
+		syncMaterializedViewState,
+	)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-
-	if view == nil {
+	if newState == nil {
 		resp.State.RemoveResource(ctx)
 		return
 	}
 
-	resp.Diagnostics.Append(syncMaterializedViewState(ctx, &state, view)...)
+	newState.Nodes = nodes
+	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, view.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
+	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
+}
+
+func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan MaterializedViewResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, view.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
-	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-}
+	state, diags := r.convergeMaterializedView(ctx, plan, true)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
-func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError(
-		"Unexpected in-place materialized view update",
-		"Materialized views are replacement-only resources. Terraform should plan a replacement instead of calling Update.",
-	)
+	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
 func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -286,32 +322,82 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 
-	if err := r.client.DeleteMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer()); err != nil {
-		resp.Diagnostics.AddError("Error deleting materialized view", fmt.Sprintf("%+v\n", err))
-	}
+	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
+		return client.DeleteMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	})...)
 }
 
-func (r *Resource) createMaterializedView(ctx context.Context, plan MaterializedViewResourceModel) (*MaterializedViewResourceModel, diag.Diagnostics) {
+// convergeMaterializedView makes every node hold the planned materialized view. Only the
+// query of a TO-table materialized view can change in place.
+func (r *Resource) convergeMaterializedView(ctx context.Context, plan MaterializedViewResourceModel, adopt bool) (*MaterializedViewResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
-	view, err := expandMaterializedViewModel(ctx, plan)
+	desired, err := expandMaterializedViewModel(ctx, plan)
 	diags.Append(schemahelpers.DiagnosticsFromErr("Invalid materialized view configuration", err)...)
 	if diags.HasError() {
 		return nil, diags
 	}
 
-	createdView, err := r.client.CreateMaterializedView(ctx, view, plan.ClusterName.ValueStringPointer())
-	diags.Append(schemahelpers.DiagnosticsFromErr("Error creating materialized view", err)...)
+	clusterName := plan.ClusterName.ValueStringPointer()
+	view, nodes, convergeDiags := schemahelpers.ConvergeNodes(ctx, r.client, adopt, schemahelpers.NodeConverger[dbops.MaterializedView]{
+		Kind:          "materialized view",
+		QualifiedName: schemahelpers.QualifiedName(desired.Database, desired.Name),
+		Get: func(ctx context.Context, client dbops.Client) (*dbops.MaterializedView, error) {
+			return client.GetMaterializedView(ctx, desired.Database, desired.Name, clusterName)
+		},
+		Create: func(ctx context.Context, client dbops.Client, _ *dbops.MaterializedView) error {
+			_, err := client.CreateMaterializedView(ctx, desired, clusterName)
+			return err
+		},
+		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.MaterializedView) error {
+			candidate := plan
+			if syncDiags := syncMaterializedViewState(ctx, &candidate, existing); syncDiags.HasError() {
+				return schemahelpers.DiagnosticsError(syncDiags)
+			}
+
+			queryChanged := !candidate.Query.Equal(plan.Query)
+			replaceAttrs := make([]string, 0)
+			for name, values := range map[string][2]attr.Value{
+				"columns":      {candidate.Columns, plan.Columns},
+				"engine":       {candidate.Engine, plan.Engine},
+				"partition_by": {candidate.PartitionBy, plan.PartitionBy},
+				"order_by":     {candidate.OrderBy, plan.OrderBy},
+				"primary_key":  {candidate.PrimaryKey, plan.PrimaryKey},
+				"sample_by":    {candidate.SampleBy, plan.SampleBy},
+				"ttl":          {candidate.TTL, plan.TTL},
+				"settings":     {candidate.Settings, plan.Settings},
+				"to_table":     {candidate.ToTable, plan.ToTable},
+				"to_columns":   {candidate.ToColumns, plan.ToColumns},
+			} {
+				if !values[0].Equal(values[1]) {
+					replaceAttrs = append(replaceAttrs, name)
+				}
+			}
+			if queryChanged && desired.ToTable == "" {
+				replaceAttrs = append(replaceAttrs, "query")
+			}
+			if len(replaceAttrs) > 0 {
+				slices.Sort(replaceAttrs)
+				return fmt.Errorf("the materialized view differs from the desired definition in attributes that cannot be changed in place: %s. Replace the materialized view or change the configuration to match it",
+					strings.Join(replaceAttrs, ", "))
+			}
+			if !queryChanged {
+				return nil
+			}
+			if clusterName != nil {
+				return errors.New("the query of a materialized view cannot be changed in place with cluster_name; use the provider fanout_cluster instead")
+			}
+			return node.Client.ModifyMaterializedViewQuery(ctx, desired.Database, desired.Name, desired.Query)
+		},
+	})
+	diags.Append(convergeDiags...)
 	if diags.HasError() {
-		return nil, diags
-	}
-	if createdView == nil {
-		diags.AddError("Error creating materialized view", "ClickHouse returned no metadata for the created materialized view.")
 		return nil, diags
 	}
 
 	state := plan
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, createdView.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
+	state.Nodes = nodes
+	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, view.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
 
 	return &state, diags
 }
@@ -323,27 +409,28 @@ func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequ
 func syncMaterializedViewState(ctx context.Context, state *MaterializedViewResourceModel, view *dbops.MaterializedView) diag.Diagnostics {
 	var diags diag.Diagnostics
 
-	state.Query = schemahelpers.SyncOptionalString(state.Query, view.Query)
-	state.Engine = schemahelpers.SyncOptionalString(state.Engine, view.Engine)
-	state.PartitionBy = schemahelpers.SyncOptionalString(state.PartitionBy, view.PartitionBy)
-	state.OrderBy = schemahelpers.SyncOptionalString(state.OrderBy, view.OrderBy)
-	state.PrimaryKey = schemahelpers.SyncOptionalString(state.PrimaryKey, view.PrimaryKey)
-	state.SampleBy = schemahelpers.SyncOptionalString(state.SampleBy, view.SampleBy)
-	state.TTL = schemahelpers.SyncOptionalString(state.TTL, view.TTL)
-	state.Settings = schemahelpers.SyncOptionalString(state.Settings, view.Settings)
-	state.ToTable = schemahelpers.SyncOptionalString(state.ToTable, view.ToTable)
+	state.Query = schemahelpers.SyncEquivalentString(state.Query, view.Query)
+	state.Engine = schemahelpers.SyncEquivalentString(state.Engine, view.Engine)
+	state.PartitionBy = schemahelpers.SyncEquivalentString(state.PartitionBy, view.PartitionBy)
+	state.OrderBy = schemahelpers.SyncEquivalentString(state.OrderBy, view.OrderBy)
+	state.PrimaryKey = schemahelpers.SyncEquivalentString(state.PrimaryKey, view.PrimaryKey)
+	state.SampleBy = schemahelpers.SyncEquivalentString(state.SampleBy, view.SampleBy)
+	state.TTL = schemahelpers.SyncEquivalentString(state.TTL, view.TTL)
+	state.Settings = schemahelpers.SyncEquivalentString(state.Settings, view.Settings)
+	state.ToTable = schemahelpers.SyncEquivalentString(state.ToTable, view.ToTable)
 
 	if view.Populate || (!state.Populate.IsNull() && !state.Populate.IsUnknown()) {
 		state.Populate = types.BoolValue(view.Populate)
 	}
 
-	// Sync columns for engine-backed materialized views
+	// Sync columns for engine-backed materialized views. ClickHouse stores an inferred column
+	// list, which is compared only when the configuration sets columns.
 	currentColumns, columnDiags := schemahelpers.ExpandColumns(ctx, state.Columns)
 	diags.Append(columnDiags...)
 	if diags.HasError() {
 		return diags
 	}
-	if !schemahelpers.ColumnsEqual(currentColumns, view.Columns) {
+	if !state.Columns.IsNull() && !schemahelpers.ColumnsEqual(currentColumns, view.Columns) {
 		columns, columnDiags := schemahelpers.ColumnsValue(ctx, view.Columns)
 		diags.Append(columnDiags...)
 		if diags.HasError() {
@@ -352,7 +439,11 @@ func syncMaterializedViewState(ctx context.Context, state *MaterializedViewResou
 		state.Columns = columns
 	}
 
-	// Sync to_columns for TO-based materialized views
+	// ClickHouse stores an inferred column list for every TO-table materialized view. It is
+	// compared only when the configuration sets to_columns.
+	if state.ToColumns.IsNull() {
+		return diags
+	}
 	currentToColumns, toColumnDiags := schemahelpers.ExpandColumnSignatures(ctx, state.ToColumns)
 	diags.Append(toColumnDiags...)
 	if diags.HasError() {

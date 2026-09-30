@@ -3,6 +3,8 @@ package dbops
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/pingcap/errors"
@@ -19,13 +21,25 @@ type Column struct {
 	DefaultExpression      *string
 	MaterializedExpression *string
 	AliasExpression        *string
+	EphemeralExpression    *string
+	Codec                  string
+	TTL                    string
 }
+
+type (
+	Index      = querybuilder.IndexDefinition
+	Projection = querybuilder.ProjectionDefinition
+	Constraint = querybuilder.ConstraintDefinition
+)
 
 type Table struct {
 	Database        string
 	Name            string
 	Engine          string
 	Columns         []Column
+	Indexes         []Index
+	Projections     []Projection
+	Constraints     []Constraint
 	PartitionBy     string
 	OrderBy         string
 	PrimaryKey      string
@@ -84,6 +98,9 @@ func (i *impl) CreateTable(ctx context.Context, table Table, clusterName *string
 		Name:        table.Name,
 		ClusterName: clusterName,
 		Columns:     toQueryBuilderColumns(table.Columns),
+		Indexes:     table.Indexes,
+		Projections: table.Projections,
+		Constraints: table.Constraints,
 		Engine:      table.Engine,
 		PartitionBy: table.PartitionBy,
 		OrderBy:     table.OrderBy,
@@ -113,9 +130,9 @@ func (i *impl) GetTable(ctx context.Context, database string, name string, clust
 		return nil, nil
 	}
 
-	columns, err := i.getTableColumns(ctx, database, name, clusterName)
+	elements, err := parseCreateTableElements(object.CreateStatement)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithMessage(err, "error parsing column list of CREATE TABLE statement")
 	}
 	definition, err := parseCreateTableDefinition(object.CreateStatement)
 	if err != nil {
@@ -134,7 +151,10 @@ func (i *impl) GetTable(ctx context.Context, database string, name string, clust
 		Database:        object.Database,
 		Name:            object.Name,
 		Engine:          engine,
-		Columns:         columns,
+		Columns:         elements.Columns,
+		Indexes:         elements.Indexes,
+		Projections:     elements.Projections,
+		Constraints:     elements.Constraints,
 		PartitionBy:     definition.PartitionBy,
 		OrderBy:         definition.OrderBy,
 		PrimaryKey:      definition.PrimaryKey,
@@ -185,10 +205,19 @@ func (i *impl) AlterTable(ctx context.Context, database string, name string, clu
 }
 
 func (i *impl) CreateView(ctx context.Context, view View, clusterName *string) (*View, error) {
+	return i.createView(ctx, view, clusterName, false)
+}
+
+func (i *impl) ReplaceView(ctx context.Context, view View, clusterName *string) (*View, error) {
+	return i.createView(ctx, view, clusterName, true)
+}
+
+func (i *impl) createView(ctx context.Context, view View, clusterName *string, orReplace bool) (*View, error) {
 	sql, err := querybuilder.CreateViewQuery{
 		Database:    view.Database,
 		Name:        view.Name,
 		ClusterName: clusterName,
+		OrReplace:   orReplace,
 		Columns:     toQueryBuilderColumns(view.Columns),
 		Query:       view.Query,
 	}.Build()
@@ -289,21 +318,26 @@ func (i *impl) GetMaterializedView(ctx context.Context, database string, name st
 		Settings:        definition.Settings,
 		Populate:        definition.Populate,
 		ToTable:         definition.ToTable,
+		Columns:         definition.Columns,
 		ToColumns:       definition.ToColumns,
 		Query:           definition.Query,
 		CreateStatement: object.CreateStatement,
 	}
 
-	// For engine-backed materialized views, fetch full column details from system.columns
-	if definition.ToTable == "" {
-		columns, err := i.getTableColumns(ctx, database, name, clusterName)
-		if err != nil {
-			return nil, errors.WithMessage(err, "error fetching materialized view columns")
-		}
-		mv.Columns = columns
+	return mv, nil
+}
+
+func (i *impl) ModifyMaterializedViewQuery(ctx context.Context, database string, name string, query string) error {
+	sql, err := querybuilder.BuildModifyQuery(database, name, query)
+	if err != nil {
+		return errors.WithMessage(err, "error building query")
 	}
 
-	return mv, nil
+	if err := i.clickhouseClient.Exec(ctx, sql); err != nil {
+		return errors.WithMessage(err, "error running query")
+	}
+
+	return nil
 }
 
 func (i *impl) DeleteMaterializedView(ctx context.Context, database string, name string, clusterName *string) error {
@@ -432,110 +466,6 @@ type createMaterializedViewDefinition struct {
 	ToTable     string
 	ToColumns   []Column
 	Query       string
-}
-
-func (i *impl) getTableColumns(ctx context.Context, database string, name string, clusterName *string) ([]Column, error) {
-	sql, err := querybuilder.NewSelect(
-		[]querybuilder.Field{
-			querybuilder.NewField("name"),
-			querybuilder.NewField("type"),
-			querybuilder.NewField("default_kind"),
-			querybuilder.NewField("default_expression"),
-			querybuilder.NewField("comment"),
-		},
-		"system.columns",
-	).WithCluster(clusterName).Where(
-		querybuilder.WhereEquals("database", database),
-		querybuilder.WhereEquals("table", name),
-	).OrderBy(querybuilder.NewField("position"), querybuilder.ASC).Build()
-	if err != nil {
-		return nil, errors.WithMessage(err, "error building query")
-	}
-
-	columns := make([]Column, 0)
-	seen := make(map[string]struct{})
-	err = i.clickhouseClient.Select(ctx, sql, func(data clickhouseclient.Row) error {
-		columnName, err := data.GetString("name")
-		if err != nil {
-			return errors.WithMessage(err, "error scanning query result, missing 'name' field")
-		}
-		columnType, err := data.GetString("type")
-		if err != nil {
-			return errors.WithMessage(err, "error scanning query result, missing 'type' field")
-		}
-		defaultKind, err := data.GetString("default_kind")
-		if err != nil {
-			return errors.WithMessage(err, "error scanning query result, missing 'default_kind' field")
-		}
-		defaultExpression, err := data.GetString("default_expression")
-		if err != nil {
-			return errors.WithMessage(err, "error scanning query result, missing 'default_expression' field")
-		}
-		comment, err := data.GetString("comment")
-		if err != nil {
-			return errors.WithMessage(err, "error scanning query result, missing 'comment' field")
-		}
-
-		typeWithoutNullable, nullable := querybuilder.UnwrapNullableType(columnType)
-		column := Column{
-			Name:     columnName,
-			Type:     typeWithoutNullable,
-			Nullable: nullable,
-			Comment:  strings.TrimSpace(comment),
-		}
-
-		switch strings.TrimSpace(defaultKind) {
-		case "DEFAULT":
-			expr := strings.TrimSpace(defaultExpression)
-			column.DefaultExpression = &expr
-		case "MATERIALIZED":
-			expr := strings.TrimSpace(defaultExpression)
-			column.MaterializedExpression = &expr
-		case "ALIAS":
-			expr := strings.TrimSpace(defaultExpression)
-			column.AliasExpression = &expr
-		}
-
-		columnKey := tableColumnKey(column)
-		if _, ok := seen[columnKey]; ok {
-			return nil
-		}
-		seen[columnKey] = struct{}{}
-		columns = append(columns, column)
-		return nil
-	})
-	if err != nil {
-		return nil, errors.WithMessage(err, "error running query")
-	}
-
-	return columns, nil
-}
-
-func tableColumnKey(column Column) string {
-	defaultExpression := ""
-	if column.DefaultExpression != nil {
-		defaultExpression = *column.DefaultExpression
-	}
-
-	materializedExpression := ""
-	if column.MaterializedExpression != nil {
-		materializedExpression = *column.MaterializedExpression
-	}
-
-	aliasExpression := ""
-	if column.AliasExpression != nil {
-		aliasExpression = *column.AliasExpression
-	}
-
-	return strings.Join([]string{
-		column.Name,
-		column.Type,
-		fmt.Sprintf("%t", column.Nullable),
-		column.Comment,
-		defaultExpression,
-		materializedExpression,
-		aliasExpression,
-	}, "\x00")
 }
 
 func parseCreateTableDefinition(createStatement string) (createTableDefinition, error) {
@@ -733,16 +663,16 @@ func parseCreateMaterializedViewDefinition(createStatement string) (createMateri
 			clause = nextClause
 		}
 
-		// Engine value may be preceded by column signatures in parens.
+		// Engine value may be preceded by column definitions in parens.
 		columnPrefix := strings.TrimSpace(prefix[:engineIndex])
 		if openIdx, closeIdx, ok, parseErr := querybuilder.FindTrailingTopLevelParentheses(columnPrefix); parseErr != nil {
 			return definition, parseErr
 		} else if ok {
-			columns, parseErr := parseColumnSignatures(columnPrefix[openIdx+1 : closeIdx])
+			elements, parseErr := parseTableElements(columnPrefix[openIdx+1 : closeIdx])
 			if parseErr != nil {
 				return definition, parseErr
 			}
-			definition.Columns = columns
+			definition.Columns = elements.Columns
 		}
 		return definition, nil
 	}
@@ -819,12 +749,231 @@ func parseColumnSignature(raw string) (Column, error) {
 		return Column{}, errors.New("invalid column signature")
 	}
 
-	typeWithoutNullable, nullable := querybuilder.UnwrapNullableType(typeSQL)
-	return Column{
-		Name:     name,
-		Type:     typeWithoutNullable,
-		Nullable: nullable,
-	}, nil
+	return Column{Name: name, Type: typeSQL}, nil
+}
+
+type tableElements struct {
+	Columns     []Column
+	Indexes     []Index
+	Projections []Projection
+	Constraints []Constraint
+}
+
+// parseCreateTableElements parses the first parenthesized list of a canonical CREATE TABLE
+// statement: columns, indexes, projections and constraints.
+func parseCreateTableElements(createStatement string) (tableElements, error) {
+	state := querybuilder.SQLScanState{}
+	for index := 0; index < len(createStatement); index++ {
+		if state.IsTopLevel() && createStatement[index] == '(' {
+			closeIndex, err := querybuilder.FindMatchingClose(createStatement, index)
+			if err != nil {
+				return tableElements{}, err
+			}
+			return parseTableElements(createStatement[index+1 : closeIndex])
+		}
+		var err error
+		index, err = querybuilder.AdvanceSQLScanState(createStatement, index, &state)
+		if err != nil {
+			return tableElements{}, err
+		}
+	}
+
+	return tableElements{}, nil
+}
+
+func parseTableElements(raw string) (tableElements, error) {
+	elements := tableElements{}
+	parts, err := querybuilder.SplitTopLevelCSV(raw)
+	if err != nil {
+		return elements, err
+	}
+
+	for _, part := range parts {
+		switch {
+		case strings.HasPrefix(part, "INDEX "):
+			index, err := parseIndexDefinition(part[len("INDEX "):])
+			if err != nil {
+				return elements, errors.WithMessage(err, fmt.Sprintf("error parsing %q", part))
+			}
+			elements.Indexes = append(elements.Indexes, index)
+		case strings.HasPrefix(part, "PROJECTION "):
+			name, rest, err := splitElementName(part[len("PROJECTION "):])
+			if err != nil {
+				return elements, errors.WithMessage(err, fmt.Sprintf("error parsing %q", part))
+			}
+			projection := Projection{Name: name, Query: rest}
+			if closeIndex, closeErr := querybuilder.FindMatchingClose(rest, 0); strings.HasPrefix(rest, "(") && closeErr == nil {
+				projection.Query = strings.TrimSpace(rest[1:closeIndex])
+				// PROJECTION name (query) WITH SETTINGS (a = 1)
+				if tail := strings.TrimSpace(rest[closeIndex+1:]); strings.HasPrefix(tail, "WITH SETTINGS") {
+					settings := strings.TrimSpace(strings.TrimPrefix(tail, "WITH SETTINGS"))
+					projection.Settings = strings.TrimSuffix(strings.TrimPrefix(settings, "("), ")")
+				}
+			}
+			elements.Projections = append(elements.Projections, projection)
+		case strings.HasPrefix(part, "CONSTRAINT "):
+			name, rest, err := splitElementName(part[len("CONSTRAINT "):])
+			if err != nil {
+				return elements, errors.WithMessage(err, fmt.Sprintf("error parsing %q", part))
+			}
+			if !strings.HasPrefix(rest, "CHECK ") {
+				return elements, fmt.Errorf("unsupported constraint %q: only CHECK constraints are supported", part)
+			}
+			elements.Constraints = append(elements.Constraints, Constraint{Name: name, Check: strings.TrimSpace(rest[len("CHECK "):])})
+		default:
+			column, err := parseColumnDefinition(part)
+			if err != nil {
+				return elements, errors.WithMessage(err, fmt.Sprintf("error parsing %q", part))
+			}
+			elements.Columns = append(elements.Columns, column)
+		}
+	}
+
+	return elements, nil
+}
+
+// splitElementName splits "name rest" into the unquoted name and the trimmed rest.
+func splitElementName(raw string) (string, string, error) {
+	raw = strings.TrimSpace(raw)
+	nameEnd, err := querybuilder.FindColumnNameEnd(raw)
+	if err != nil {
+		return "", "", err
+	}
+
+	return querybuilder.UnquoteIdentifier(raw[:nameEnd]), strings.TrimSpace(raw[nameEnd:]), nil
+}
+
+// parseIndexDefinition parses "name expr TYPE type [GRANULARITY n]".
+func parseIndexDefinition(raw string) (Index, error) {
+	name, rest, err := splitElementName(raw)
+	if err != nil {
+		return Index{}, err
+	}
+
+	typeIndex, err := querybuilder.FindTopLevelKeyword(rest, "TYPE", 0)
+	if err != nil {
+		return Index{}, err
+	}
+	if typeIndex == -1 {
+		return Index{}, errors.New("index definition has no TYPE clause")
+	}
+
+	index := Index{
+		Name:        name,
+		Expression:  strings.TrimSpace(rest[:typeIndex]),
+		Type:        strings.TrimSpace(rest[typeIndex+len("TYPE"):]),
+		Granularity: 1,
+	}
+
+	granularityIndex, err := querybuilder.FindTopLevelKeyword(index.Type, "GRANULARITY", 0)
+	if err != nil {
+		return Index{}, err
+	}
+	if granularityIndex != -1 {
+		index.Granularity, err = strconv.ParseInt(strings.TrimSpace(index.Type[granularityIndex+len("GRANULARITY"):]), 10, 64)
+		if err != nil {
+			return Index{}, errors.WithMessage(err, "invalid index granularity")
+		}
+		index.Type = strings.TrimSpace(index.Type[:granularityIndex])
+	}
+
+	return index, nil
+}
+
+// parseColumnDefinition parses a canonical column definition:
+// name Type [DEFAULT e | MATERIALIZED e | ALIAS e | EPHEMERAL e] [COMMENT 'c'] [CODEC(...)] [TTL e]
+func parseColumnDefinition(raw string) (Column, error) {
+	name, rest, err := splitElementName(raw)
+	if err != nil {
+		return Column{}, err
+	}
+
+	type clause struct {
+		keyword string
+		index   int
+	}
+	clauses := make([]clause, 0)
+	for _, keyword := range []string{"DEFAULT", "MATERIALIZED", "ALIAS", "EPHEMERAL", "COMMENT", "CODEC", "TTL"} {
+		index, err := querybuilder.FindTopLevelKeyword(rest, keyword, 0)
+		if err != nil {
+			return Column{}, err
+		}
+		if index != -1 {
+			clauses = append(clauses, clause{keyword: keyword, index: index})
+		}
+	}
+	sort.Slice(clauses, func(a, b int) bool { return clauses[a].index < clauses[b].index })
+
+	typeEnd := len(rest)
+	if len(clauses) > 0 {
+		typeEnd = clauses[0].index
+	}
+	column := Column{Name: name, Type: strings.TrimSpace(rest[:typeEnd])}
+	if column.Name == "" || column.Type == "" {
+		return Column{}, errors.New("invalid column definition")
+	}
+
+	for position, current := range clauses {
+		end := len(rest)
+		if position+1 < len(clauses) {
+			end = clauses[position+1].index
+		}
+		value := strings.TrimSpace(rest[current.index+len(current.keyword) : end])
+
+		switch current.keyword {
+		case "DEFAULT":
+			column.DefaultExpression = &value
+		case "MATERIALIZED":
+			column.MaterializedExpression = &value
+		case "ALIAS":
+			column.AliasExpression = &value
+		case "EPHEMERAL":
+			// EPHEMERAL without an expression stays in the type text, because the
+			// ephemeral_expression attribute cannot be empty.
+			if value == "" {
+				column.Type += " EPHEMERAL"
+				continue
+			}
+			column.EphemeralExpression = &value
+		case "COMMENT":
+			column.Comment = unquoteString(value)
+		case "CODEC":
+			column.Codec = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(value, "("), ")"))
+		case "TTL":
+			column.TTL = value
+		}
+	}
+
+	return column, nil
+}
+
+// unquoteString returns the value of a single-quoted SQL string literal.
+func unquoteString(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '\'' || raw[len(raw)-1] != '\'' {
+		return raw
+	}
+
+	var out strings.Builder
+	inner := raw[1 : len(raw)-1]
+	for index := 0; index < len(inner); index++ {
+		ch := inner[index]
+		if (ch == '\\' || ch == '\'') && index+1 < len(inner) {
+			index++
+			switch next := inner[index]; {
+			case ch == '\\' && next == 'n':
+				out.WriteByte('\n')
+			case ch == '\\' && next == 't':
+				out.WriteByte('\t')
+			default:
+				out.WriteByte(next)
+			}
+			continue
+		}
+		out.WriteByte(ch)
+	}
+
+	return out.String()
 }
 
 // ToQueryBuilderColumn converts a single Column to a querybuilder.ColumnDefinition.
@@ -842,6 +991,9 @@ func ToQueryBuilderColumn(column Column) querybuilder.ColumnDefinition {
 		DefaultExpression:      column.DefaultExpression,
 		MaterializedExpression: column.MaterializedExpression,
 		AliasExpression:        column.AliasExpression,
+		EphemeralExpression:    column.EphemeralExpression,
+		Codec:                  column.Codec,
+		TTL:                    column.TTL,
 	}
 }
 

@@ -193,7 +193,7 @@ func UnwrapNullableType(raw string) (string, bool) {
 
 // UnquoteIdentifier strips backtick quoting from an identifier.
 // Handles both backslash escaping (\`) used by ClickHouse and doubled-backtick
-// escaping (``) which is also accepted by the SQL scanner.
+// escaping (“) which is also accepted by the SQL scanner.
 func UnquoteIdentifier(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if len(raw) >= 2 && raw[0] == '`' && raw[len(raw)-1] == '`' {

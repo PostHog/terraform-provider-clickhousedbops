@@ -16,7 +16,8 @@ const (
 )
 
 func BaseName(engine string) string {
-	engine = strings.TrimSpace(engine)
+	// ClickHouse reports engines named like keywords quoted, for example `Null`.
+	engine = strings.TrimLeft(strings.TrimSpace(engine), "`")
 	if engine == "" {
 		return ""
 	}

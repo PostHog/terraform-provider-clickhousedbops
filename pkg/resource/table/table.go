@@ -4,6 +4,9 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"maps"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -17,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/tableengine"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/schemahelpers"
 )
 
@@ -51,10 +55,17 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringvalidator.LengthAtLeast(1),
 		},
 		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
+			stringplanmodifier.RequiresReplaceIf(
+				func(_ context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+					resp.RequiresReplace = !enginesEquivalent(req.StateValue.ValueString(), req.PlanValue.ValueString())
+				},
+				"Replaces the table when the engine changes, ignoring formatting.",
+				"Replaces the table when the engine changes, ignoring formatting.",
+			),
 		},
 	}
 	attrs["columns"] = schemahelpers.ColumnsAttributeWithPlanModifiers("Structured column definitions. This can be assigned directly from a local list of objects.", nil)
+	maps.Copy(attrs, elementSchemaAttributes())
 	attrs["partition_by"] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw PARTITION BY clause expression",
@@ -135,7 +146,18 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
+	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, plan.ClusterName, &resp.Plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	desiredTable, err := expandTableModel(ctx, plan)
+	resp.Diagnostics.Append(schemahelpers.DiagnosticsFromErr("Invalid table configuration", err)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	columnPatterns, indexPatterns, err := unmanagedPatterns(ctx, plan)
 	resp.Diagnostics.Append(schemahelpers.DiagnosticsFromErr("Invalid table configuration", err)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -167,6 +189,10 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	currentTable = filterUnmanaged(currentTable, desiredTable, columnPatterns, indexPatterns)
+	if r.client.IgnoreColumnOrder() {
+		currentTable.Columns = alignColumnOrder(currentTable.Columns, desiredTable.Columns)
+	}
 
 	settingNames := collectSettingNames(currentTable.Settings, desiredTable.Settings)
 	settingCapabilities, err := r.client.GetTableSettingCapabilities(ctx, currentTable.Engine, settingNames)
@@ -193,7 +219,7 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		return
 	}
 
-	state, diags := r.createTable(ctx, plan)
+	state, diags := r.convergeTable(ctx, plan, r.client.AdoptExisting())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -209,108 +235,71 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	table, err := r.client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
-	if err != nil {
-		resp.Diagnostics.AddError("Error reading table", fmt.Sprintf("%+v\n", err))
-		return
-	}
-
-	if table == nil {
-		resp.State.RemoveResource(ctx)
-		return
-	}
-
-	var settingCapabilities map[string]dbops.TableSettingCapability
-	if normalizeSQL(table.Settings) != "" {
-		var err error
-		settingCapabilities, err = r.client.GetTableSettingCapabilities(ctx, table.Engine, collectSettingNames(table.Settings))
-		if err != nil {
-			resp.Diagnostics.AddWarning(
-				"Error reading table setting capabilities",
-				fmt.Sprintf("Skipping remote settings reconciliation because setting capabilities could not be read: %+v", err),
-			)
-		}
-	}
-
-	resp.Diagnostics.Append(syncTableState(ctx, &state, table, settingCapabilities)...)
+	declared, err := expandTableModel(ctx, state)
+	resp.Diagnostics.Append(schemahelpers.DiagnosticsFromErr("Invalid table state", err)...)
+	columnPatterns, indexPatterns, err := unmanagedPatterns(ctx, state)
+	resp.Diagnostics.Append(schemahelpers.DiagnosticsFromErr("Invalid table state", err)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, table.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
-	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+	newState, table, nodes, diags := schemahelpers.ReadNodes(ctx, r.client, state,
+		func(ctx context.Context, client dbops.Client) (*dbops.Table, error) {
+			table, err := client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+			if err != nil || table == nil {
+				return nil, err
+			}
+			filtered := filterUnmanaged(*table, declared, columnPatterns, indexPatterns)
+			if r.client.IgnoreColumnOrder() {
+				filtered.Columns = alignColumnOrder(filtered.Columns, declared.Columns)
+			}
+			return &filtered, nil
+		},
+		func(ctx context.Context, state *TableResourceModel, table *dbops.Table) diag.Diagnostics {
+			var diags diag.Diagnostics
+			var settingCapabilities map[string]dbops.TableSettingCapability
+			if normalizeSQL(table.Settings) != "" {
+				var err error
+				settingCapabilities, err = r.client.GetTableSettingCapabilities(ctx, table.Engine, collectSettingNames(table.Settings))
+				if err != nil {
+					diags.AddWarning(
+						"Error reading table setting capabilities",
+						fmt.Sprintf("Skipping remote settings reconciliation because setting capabilities could not be read: %+v", err),
+					)
+				}
+			}
+			diags.Append(syncTableState(ctx, state, table, settingCapabilities)...)
+			return diags
+		},
+	)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if newState == nil {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
+	newState.Nodes = nodes
+	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, table.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
+	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var state, plan TableResourceModel
-	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	var plan TableResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	currentTable, err := expandTableModel(ctx, state)
-	resp.Diagnostics.Append(schemahelpers.DiagnosticsFromErr("Invalid table configuration", err)...)
+	state, diags := r.convergeTable(ctx, plan, true)
+	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	desiredTable, err := expandTableModel(ctx, plan)
-	resp.Diagnostics.Append(schemahelpers.DiagnosticsFromErr("Invalid table configuration", err)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	capabilities, err := r.client.GetTableEngineCapabilities(ctx, desiredTable.Engine)
-	if err != nil {
-		resp.Diagnostics.AddError("Error reading table engine capabilities", fmt.Sprintf("%+v\n", err))
-		return
-	}
-
-	settingNames := collectSettingNames(currentTable.Settings, desiredTable.Settings)
-	settingCapabilities, err := r.client.GetTableSettingCapabilities(ctx, currentTable.Engine, settingNames)
-	if err != nil {
-		resp.Diagnostics.AddError("Error reading table setting capabilities", fmt.Sprintf("%+v\n", err))
-		return
-	}
-
-	updatePlan, err := planTableUpdate(currentTable, desiredTable, capabilities, settingCapabilities)
-	if err != nil {
-		resp.Diagnostics.AddError("Error planning table update", fmt.Sprintf("%+v\n", err))
-		return
-	}
-	if len(updatePlan.ReplaceAttrs) > 0 {
-		resp.Diagnostics.AddError(
-			"Table update requires replacement",
-			"The planned table change requires Terraform to replace the resource instead of updating it in place.",
-		)
-		return
-	}
-
-	for _, actionGroup := range updatePlan.ActionGroups {
-		if err := r.client.AlterTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer(), actionGroup); err != nil {
-			resp.Diagnostics.AddError("Error updating table", fmt.Sprintf("%+v\n", err))
-			return
-		}
-	}
-
-	updatedTable, err := r.client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
-	if err != nil {
-		resp.Diagnostics.AddError("Error reading updated table", fmt.Sprintf("%+v\n", err))
-		return
-	}
-	if updatedTable == nil {
-		resp.Diagnostics.AddError("Error reading updated table", "Updated table was not found after applying ALTER TABLE statements.")
-		return
-	}
-
-	newState := plan
-	resp.Diagnostics.Append(syncTableState(ctx, &newState, updatedTable, settingCapabilities)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, updatedTable.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
-	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
 func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -320,38 +309,131 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 
-	if err := r.client.DeleteTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer()); err != nil {
-		resp.Diagnostics.AddError("Error deleting table", fmt.Sprintf("%+v\n", err))
-	}
+	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
+		return client.DeleteTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	})...)
 }
 
 func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	schemahelpers.ImportSchemaObjectState(ctx, req, resp)
 }
 
-func (r *Resource) createTable(ctx context.Context, plan TableResourceModel) (*TableResourceModel, diag.Diagnostics) {
+// convergeTable makes every node hold the planned table: it alters existing tables in place
+// and creates the table where it is missing.
+func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, adopt bool) (*TableResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
-	table, err := expandTableModel(ctx, plan)
+	desired, err := expandTableModel(ctx, plan)
+	diags.Append(schemahelpers.DiagnosticsFromErr("Invalid table configuration", err)...)
+	columnPatterns, indexPatterns, err := unmanagedPatterns(ctx, plan)
 	diags.Append(schemahelpers.DiagnosticsFromErr("Invalid table configuration", err)...)
 	if diags.HasError() {
 		return nil, diags
 	}
 
-	createdTable, err := r.client.CreateTable(ctx, table, plan.ClusterName.ValueStringPointer())
-	diags.Append(schemahelpers.DiagnosticsFromErr("Error creating table", err)...)
-	if diags.HasError() {
+	capabilities, err := r.client.GetTableEngineCapabilities(ctx, desired.Engine)
+	if err != nil {
+		diags.AddError("Error reading table engine capabilities", fmt.Sprintf("%+v\n", err))
 		return nil, diags
 	}
-	if createdTable == nil {
-		diags.AddError("Error creating table", "ClickHouse returned no metadata for the created table.")
+
+	clusterName := plan.ClusterName.ValueStringPointer()
+	// ClickHouse replicates every ALTER of a Replicated table through Keeper, except MODIFY
+	// SETTING and RESET SETTING, which change only the replica that runs them.
+	replicated := strings.HasPrefix(strings.ToLower(tableengine.BaseName(desired.Engine)), "replicated")
+
+	table, nodes, convergeDiags := schemahelpers.ConvergeNodes(ctx, r.client, adopt, schemahelpers.NodeConverger[dbops.Table]{
+		Kind:          "table",
+		QualifiedName: schemahelpers.QualifiedName(desired.Database, desired.Name),
+		Get: func(ctx context.Context, client dbops.Client) (*dbops.Table, error) {
+			return client.GetTable(ctx, desired.Database, desired.Name, clusterName)
+		},
+		Create: func(ctx context.Context, client dbops.Client, reference *dbops.Table) error {
+			table := desired
+			if replicated && reference != nil {
+				// A new replica must declare the structure that Keeper holds for the shard:
+				// the same indexes in the same order, and the unmanaged columns and indexes.
+				table.Columns, table.Indexes, table.Projections, table.Constraints = reference.Columns, reference.Indexes, reference.Projections, reference.Constraints
+			}
+			_, err := client.CreateTable(ctx, table, clusterName)
+			return err
+		},
+		Reconcile: func(ctx context.Context, node dbops.SchemaNode, firstInShard bool, existing *dbops.Table) error {
+			remote := filterUnmanaged(*existing, desired, columnPatterns, indexPatterns)
+			if r.client.IgnoreColumnOrder() {
+				remote.Columns = alignColumnOrder(remote.Columns, desired.Columns)
+			}
+			settingCapabilities, err := r.client.GetTableSettingCapabilities(ctx, remote.Engine, collectSettingNames(remote.Settings, desired.Settings))
+			if err != nil {
+				return err
+			}
+
+			// The node's table is read the way Read reads it, so that text that is only
+			// formatted differently from the plan is not a change.
+			candidate := plan
+			if syncDiags := syncTableState(ctx, &candidate, &remote, settingCapabilities); syncDiags.HasError() {
+				return schemahelpers.DiagnosticsError(syncDiags)
+			}
+			current, err := expandTableModel(ctx, candidate)
+			if err != nil {
+				return err
+			}
+
+			updatePlan := plannedTableUpdate{ReplaceAttrs: map[string]struct{}{}}
+			if replicated && !firstInShard {
+				actions, replace, err := planSettingsUpdate(current.Settings, desired.Settings, buildEngineUpdateStrategy(capabilities), settingCapabilities)
+				if err != nil {
+					return err
+				}
+				if replace {
+					updatePlan.ReplaceAttrs["settings"] = struct{}{}
+				}
+				updatePlan.ActionGroups = actions
+			} else {
+				updatePlan, err = planTableUpdate(current, desired, capabilities, settingCapabilities)
+				if err != nil {
+					return err
+				}
+			}
+			if !enginesEquivalent(remote.Engine, desired.Engine) {
+				updatePlan.ReplaceAttrs["engine"] = struct{}{}
+			}
+			if len(updatePlan.ReplaceAttrs) > 0 {
+				return fmt.Errorf("the table differs from the desired definition in attributes that cannot be changed in place: %s. Replace the table or change the configuration to match it",
+					strings.Join(slices.Sorted(maps.Keys(updatePlan.ReplaceAttrs)), ", "))
+			}
+
+			for _, actionGroup := range updatePlan.ActionGroups {
+				if err := node.Client.AlterTable(ctx, desired.Database, desired.Name, clusterName, actionGroup); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	})
+	diags.Append(convergeDiags...)
+	if diags.HasError() {
 		return nil, diags
 	}
 
 	state := plan
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, createdTable.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
+	state.Nodes = nodes
+	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, table.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
 
 	return &state, diags
+}
+
+func unmanagedPatterns(ctx context.Context, model TableResourceModel) ([]*regexp.Regexp, []*regexp.Regexp, error) {
+	columnPatterns, err := compilePatterns(ctx, "unmanaged_columns", model.UnmanagedColumns)
+	if err != nil {
+		return nil, nil, err
+	}
+	indexPatterns, err := compilePatterns(ctx, "unmanaged_indexes", model.UnmanagedIndexes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return columnPatterns, indexPatterns, nil
 }
 
 func expandTableModel(ctx context.Context, plan TableResourceModel) (dbops.Table, error) {
@@ -360,7 +442,7 @@ func expandTableModel(ctx context.Context, plan TableResourceModel) (dbops.Table
 		return dbops.Table{}, schemahelpers.DiagnosticsError(diags)
 	}
 
-	return dbops.Table{
+	table := dbops.Table{
 		Database:    plan.Database.ValueString(),
 		Name:        plan.Name.ValueString(),
 		Engine:      plan.Engine.ValueString(),
@@ -372,11 +454,22 @@ func expandTableModel(ctx context.Context, plan TableResourceModel) (dbops.Table
 		TTL:         plan.TTL.ValueString(),
 		Settings:    plan.Settings.ValueString(),
 		AsSelect:    plan.AsSelect.ValueString(),
-	}, nil
+	}
+	if diags := expandElements(ctx, plan, &table); diags.HasError() {
+		return dbops.Table{}, schemahelpers.DiagnosticsError(diags)
+	}
+
+	return table, nil
 }
 
 func syncTableState(ctx context.Context, state *TableResourceModel, table *dbops.Table, settingCapabilities map[string]dbops.TableSettingCapability) diag.Diagnostics {
 	var diags diag.Diagnostics
+
+	current, err := expandTableModel(ctx, *state)
+	diags.Append(schemahelpers.DiagnosticsFromErr("Invalid table state", err)...)
+	if diags.HasError() {
+		return diags
+	}
 
 	state.Engine = syncEquivalentString(state.Engine, table.Engine, enginesEquivalent)
 	state.PartitionBy = syncEquivalentString(state.PartitionBy, table.PartitionBy, expressionsEqual)
@@ -387,15 +480,12 @@ func syncTableState(ctx context.Context, state *TableResourceModel, table *dbops
 	state.Settings = syncRemoteSettings(state.Settings, table.Settings, settingCapabilities)
 	state.AsSelect = syncManagedAsSelect(state.AsSelect, table.AsSelect)
 
-	currentColumns, columnDiags := schemahelpers.ExpandColumns(ctx, state.Columns)
-	diags.Append(columnDiags...)
-	if diags.HasError() {
-		return diags
-	}
-	if !schemahelpers.ColumnsEqual(currentColumns, table.Columns) {
+	if !schemahelpers.ColumnsEqual(current.Columns, table.Columns) {
+		var columnDiags diag.Diagnostics
 		state.Columns, columnDiags = schemahelpers.ColumnsValue(ctx, table.Columns)
 		diags.Append(columnDiags...)
 	}
+	diags.Append(syncElements(ctx, state, current, table)...)
 
 	return diags
 }
@@ -515,4 +605,29 @@ func normalizeEngine(value string) string {
 		return strings.TrimSuffix(value, "()")
 	}
 	return value
+}
+
+// alignColumnOrder reorders remote columns to follow the declared order. Columns that are not
+// declared keep their relative order and go last.
+func alignColumnOrder(remote []dbops.Column, declared []dbops.Column) []dbops.Column {
+	byName := make(map[string]dbops.Column, len(remote))
+	for _, column := range remote {
+		byName[column.Name] = column
+	}
+
+	aligned := make([]dbops.Column, 0, len(remote))
+	seen := make(map[string]struct{}, len(declared))
+	for _, column := range declared {
+		if existing, ok := byName[column.Name]; ok {
+			aligned = append(aligned, existing)
+			seen[column.Name] = struct{}{}
+		}
+	}
+	for _, column := range remote {
+		if _, ok := seen[column.Name]; !ok {
+			aligned = append(aligned, column)
+		}
+	}
+
+	return aligned
 }

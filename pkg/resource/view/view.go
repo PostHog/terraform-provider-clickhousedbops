@@ -3,15 +3,13 @@ package view
 import (
 	"context"
 	_ "embed"
-	"fmt"
-	"strings"
+	"reflect"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
@@ -25,6 +23,7 @@ var viewResourceDescription string
 var (
 	_ resource.Resource                = &Resource{}
 	_ resource.ResourceWithConfigure   = &Resource{}
+	_ resource.ResourceWithModifyPlan  = &Resource{}
 	_ resource.ResourceWithImportState = &Resource{}
 )
 
@@ -42,15 +41,12 @@ func (r *Resource) Metadata(_ context.Context, req resource.MetadataRequest, res
 
 func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	attrs := schemahelpers.CommonSchemaAttributes("view")
-	attrs["columns"] = schemahelpers.ColumnSignaturesAttribute("Optional view signature. Only name, type, and nullable are included in the CREATE VIEW signature.")
+	attrs["columns"] = schemahelpers.ColumnSignaturesAttributeWithPlanModifiers("Optional view signature. Only name, type, and nullable are included in the CREATE VIEW signature. When omitted, the column list that ClickHouse infers is not tracked.", nil)
 	attrs["query"] = schema.StringAttribute{
 		Required:    true,
-		Description: "Raw SELECT query used by the view definition",
+		Description: "Raw SELECT query used by the view definition. A change is applied in place with CREATE OR REPLACE VIEW.",
 		Validators: []validator.String{
 			stringvalidator.LengthAtLeast(1),
-		},
-		PlanModifiers: []planmodifier.String{
-			stringplanmodifier.RequiresReplace(),
 		},
 	}
 	resp.Schema = schema.Schema{
@@ -67,6 +63,20 @@ func (r *Resource) Configure(_ context.Context, req resource.ConfigureRequest, _
 	r.client = req.ProviderData.(dbops.Client)
 }
 
+func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() || r.client == nil {
+		return
+	}
+
+	var clusterName types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("cluster_name"), &clusterName)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, clusterName, &resp.Plan)...)
+}
+
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan ViewResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -74,7 +84,7 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		return
 	}
 
-	state, diags := r.createView(ctx, plan)
+	state, diags := r.convergeView(ctx, plan, r.client.AdoptExisting())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -90,31 +100,40 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	view, err := r.client.GetView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
-	if err != nil {
-		resp.Diagnostics.AddError("Error reading view", fmt.Sprintf("%+v\n", err))
+	newState, view, nodes, diags := schemahelpers.ReadNodes(ctx, r.client, state,
+		func(ctx context.Context, client dbops.Client) (*dbops.View, error) {
+			return client.GetView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+		},
+		syncViewState,
+	)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-
-	if view == nil {
+	if newState == nil {
 		resp.State.RemoveResource(ctx)
 		return
 	}
 
-	resp.Diagnostics.Append(syncViewState(ctx, &state, view)...)
+	newState.Nodes = nodes
+	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, view.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
+	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
+}
+
+func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan ViewResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, view.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
-	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-}
+	state, diags := r.convergeView(ctx, plan, true)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
-func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError(
-		"Unexpected in-place view update",
-		"Views are replacement-only resources. Terraform should plan a replacement instead of calling Update.",
-	)
+	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
 func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -124,36 +143,57 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 
-	if err := r.client.DeleteView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer()); err != nil {
-		resp.Diagnostics.AddError("Error deleting view", fmt.Sprintf("%+v\n", err))
-	}
+	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
+		return client.DeleteView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	})...)
 }
 
 func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	schemahelpers.ImportSchemaObjectState(ctx, req, resp)
 }
 
-func (r *Resource) createView(ctx context.Context, plan ViewResourceModel) (*ViewResourceModel, diag.Diagnostics) {
+// convergeView makes every node hold the planned view. A view that differs is replaced in
+// place with CREATE OR REPLACE VIEW.
+func (r *Resource) convergeView(ctx context.Context, plan ViewResourceModel, adopt bool) (*ViewResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
-	view, err := expandViewModel(ctx, plan)
+	desired, err := expandViewModel(ctx, plan)
 	diags.Append(schemahelpers.DiagnosticsFromErr("Invalid view configuration", err)...)
 	if diags.HasError() {
 		return nil, diags
 	}
 
-	createdView, err := r.client.CreateView(ctx, view, plan.ClusterName.ValueStringPointer())
-	diags.Append(schemahelpers.DiagnosticsFromErr("Error creating view", err)...)
+	clusterName := plan.ClusterName.ValueStringPointer()
+	view, nodes, convergeDiags := schemahelpers.ConvergeNodes(ctx, r.client, adopt, schemahelpers.NodeConverger[dbops.View]{
+		Kind:          "view",
+		QualifiedName: schemahelpers.QualifiedName(desired.Database, desired.Name),
+		Get: func(ctx context.Context, client dbops.Client) (*dbops.View, error) {
+			return client.GetView(ctx, desired.Database, desired.Name, clusterName)
+		},
+		Create: func(ctx context.Context, client dbops.Client, _ *dbops.View) error {
+			_, err := client.CreateView(ctx, desired, clusterName)
+			return err
+		},
+		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.View) error {
+			candidate := plan
+			if syncDiags := syncViewState(ctx, &candidate, existing); syncDiags.HasError() {
+				return schemahelpers.DiagnosticsError(syncDiags)
+			}
+			if reflect.DeepEqual(candidate, plan) {
+				return nil
+			}
+			_, err := node.Client.ReplaceView(ctx, desired, clusterName)
+			return err
+		},
+	})
+	diags.Append(convergeDiags...)
 	if diags.HasError() {
-		return nil, diags
-	}
-	if createdView == nil {
-		diags.AddError("Error creating view", "ClickHouse returned no metadata for the created view.")
 		return nil, diags
 	}
 
 	state := plan
-	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, createdView.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
+	state.Nodes = nodes
+	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, view.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
 
 	return &state, diags
 }
@@ -175,12 +215,13 @@ func expandViewModel(ctx context.Context, plan ViewResourceModel) (dbops.View, e
 func syncViewState(ctx context.Context, state *ViewResourceModel, view *dbops.View) diag.Diagnostics {
 	var diags diag.Diagnostics
 
-	if strings.TrimSpace(view.Query) != "" {
-		state.Query = types.StringValue(view.Query)
-	} else if !state.Query.IsNull() && !state.Query.IsUnknown() {
-		state.Query = types.StringNull()
-	}
+	state.Query = schemahelpers.SyncEquivalentString(state.Query, view.Query)
 
+	// ClickHouse stores an inferred column list for every view. It is compared only when
+	// the configuration sets columns.
+	if state.Columns.IsNull() {
+		return diags
+	}
 	currentColumns, columnDiags := schemahelpers.ExpandColumnSignatures(ctx, state.Columns)
 	diags.Append(columnDiags...)
 	if diags.HasError() {
@@ -197,4 +238,3 @@ func syncViewState(ctx context.Context, state *ViewResourceModel, view *dbops.Vi
 
 	return diags
 }
-

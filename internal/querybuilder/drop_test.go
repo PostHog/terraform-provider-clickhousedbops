@@ -14,27 +14,27 @@ func Test_drop(t *testing.T) {
 		{
 			name:    "Drop dictionary on cluster",
 			builder: NewDropDictionary("db1", "dict1").WithCluster(&cluster),
-			want:    "DROP DICTIONARY `db1`.`dict1` ON CLUSTER 'cluster1';",
+			want:    "DROP DICTIONARY IF EXISTS `db1`.`dict1` ON CLUSTER 'cluster1' SYNC;",
 		},
 		{
 			name:    "Drop table",
 			builder: NewDropTable("db1", "tbl1"),
-			want:    "DROP TABLE `db1`.`tbl1`;",
+			want:    "DROP TABLE IF EXISTS `db1`.`tbl1` SYNC;",
 		},
 		{
 			name:    "Drop view",
 			builder: NewDropView("db1", "view1"),
-			want:    "DROP VIEW `db1`.`view1`;",
+			want:    "DROP VIEW IF EXISTS `db1`.`view1` SYNC;",
 		},
 		{
 			name:    "Drop materialized view",
 			builder: NewDropMaterializedView("db1", "mv1"),
-			want:    "DROP VIEW `db1`.`mv1`;",
+			want:    "DROP VIEW IF EXISTS `db1`.`mv1` SYNC;",
 		},
 		{
 			name:    "Drop materialized view on cluster",
 			builder: NewDropMaterializedView("db1", "mv1").WithCluster(&cluster),
-			want:    "DROP VIEW `db1`.`mv1` ON CLUSTER 'cluster1';",
+			want:    "DROP VIEW IF EXISTS `db1`.`mv1` ON CLUSTER 'cluster1' SYNC;",
 		},
 		{
 			name:    "Drop database",

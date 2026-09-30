@@ -30,20 +30,31 @@ type Dictionary struct {
 	Source          string
 	Layout          string
 	Lifetime        string
+	Range           string
 	Settings        string
 	CreateStatement string
 }
 
 func (i *impl) CreateDictionary(ctx context.Context, dictionary Dictionary, clusterName *string) (*Dictionary, error) {
+	return i.createDictionary(ctx, dictionary, clusterName, false)
+}
+
+func (i *impl) ReplaceDictionary(ctx context.Context, dictionary Dictionary, clusterName *string) (*Dictionary, error) {
+	return i.createDictionary(ctx, dictionary, clusterName, true)
+}
+
+func (i *impl) createDictionary(ctx context.Context, dictionary Dictionary, clusterName *string, orReplace bool) (*Dictionary, error) {
 	sql, err := querybuilder.CreateDictionaryQuery{
 		Database:    dictionary.Database,
 		Name:        dictionary.Name,
 		ClusterName: clusterName,
+		OrReplace:   orReplace,
 		Attributes:  toQueryBuilderDictionaryAttributes(dictionary.Attributes),
 		PrimaryKey:  dictionary.PrimaryKey,
 		Source:      dictionary.Source,
 		Layout:      dictionary.Layout,
 		Lifetime:    dictionary.Lifetime,
+		Range:       dictionary.Range,
 		Settings:    dictionary.Settings,
 		Comment:     dictionary.Comment,
 	}.Build()
@@ -139,6 +150,7 @@ func (i *impl) GetDictionary(ctx context.Context, database string, name string, 
 	dictionary.Source = definition.Source
 	dictionary.Layout = definition.Layout
 	dictionary.Lifetime = definition.Lifetime
+	dictionary.Range = definition.Range
 	if definition.Settings != "" {
 		dictionary.Settings = definition.Settings
 	}
@@ -182,6 +194,7 @@ type createDictionaryDefinition struct {
 	Source     string
 	Layout     string
 	Lifetime   string
+	Range      string
 	Settings   string
 }
 
@@ -272,6 +285,20 @@ func parseCreateDictionaryDefinition(createStatement string) (createDictionaryDe
 			return definition, errors.WithMessage(err, "error parsing LAYOUT clause")
 		}
 		definition.Layout = inner
+		remainder = remainder[end:]
+	}
+
+	// RANGE(...) — extract inner content
+	rangeIndex, err := querybuilder.FindTopLevelKeyword(remainder, "RANGE", 0)
+	if err != nil {
+		return definition, err
+	}
+	if rangeIndex != -1 {
+		inner, end, err := extractTopLevelParenContent(remainder, rangeIndex+len("RANGE"))
+		if err != nil {
+			return definition, errors.WithMessage(err, "error parsing RANGE clause")
+		}
+		definition.Range = inner
 		remainder = remainder[end:]
 	}
 
@@ -375,13 +402,7 @@ func parseDictionaryAttribute(raw string) (DictionaryAttribute, error) {
 		}
 	}
 
-	rawType := strings.TrimSpace(remainder[:typEnd])
-	if inner, ok := querybuilder.UnwrapNullableType(rawType); ok {
-		attr.Type = inner
-		attr.Nullable = true
-	} else {
-		attr.Type = rawType
-	}
+	attr.Type = strings.TrimSpace(remainder[:typEnd])
 
 	remainder = strings.TrimSpace(remainder[typEnd:])
 

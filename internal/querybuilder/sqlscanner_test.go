@@ -356,3 +356,28 @@ func indexSubstring(s, substr string) int {
 	}
 	return -1
 }
+
+func TestNormalizeSQL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "trims and collapses whitespace", raw: "  SELECT\n    a\tFROM   t ", want: "SELECT a FROM t"},
+		{name: "pretty-printed list equals single line", raw: "(\n  a,\n  b\n)", want: "(a, b)"},
+		{name: "adds the space after a comma", raw: "f(a,b,[1,2])", want: "f(a, b, [1, 2])"},
+		{name: "removes whitespace inside brackets", raw: "f( a , [ 1 ] )", want: "f(a, [1])"},
+		{name: "keeps single-quoted text", raw: "x = 'a ,  b( c )\n'", want: "x = 'a ,  b( c )\n'"},
+		{name: "keeps backticked identifiers", raw: "`a  ,b` ,  c", want: "`a  ,b`, c"},
+		{name: "keeps escaped quotes inside strings", raw: `'it\'s ,  x'  ,y`, want: `'it\'s ,  x', y`},
+		{name: "multi-line query", raw: "SELECT\n    id,\n    count() AS c\nFROM db.t\nWHERE id IN (\n    1,\n    2\n)", want: "SELECT id, count() AS c FROM db.t WHERE id IN (1, 2)"},
+		{name: "unbalanced input is only trimmed", raw: " a ) ", want: "a )"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NormalizeSQL(tt.raw); got != tt.want {
+				t.Errorf("NormalizeSQL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -3,6 +3,7 @@ package table
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -27,6 +28,7 @@ type engineUpdateStrategy struct {
 	allowSampleByAlter bool
 	allowTTLAlter      bool
 	allowOrderByAlter  bool
+	allowIndexAlter    bool
 }
 
 type columnUpdatePlan struct {
@@ -158,6 +160,23 @@ func planTableUpdate(current dbops.Table, desired dbops.Table, capabilities dbop
 		}
 	}
 
+	indexDrops, indexAdds := planNamedChanges(current.Indexes, desired.Indexes, indexName, indexEqual, querybuilder.BuildAddIndexAction, querybuilder.BuildDropIndexAction)
+	projectionDrops, projectionAdds := planNamedChanges(current.Projections, desired.Projections, projectionName, projectionEqual, querybuilder.BuildAddProjectionAction, querybuilder.BuildDropProjectionAction)
+	constraintDrops, constraintAdds := planNamedChanges(current.Constraints, desired.Constraints, constraintName, constraintEqual, querybuilder.BuildAddConstraintAction, querybuilder.BuildDropConstraintAction)
+	if !strategy.allowIndexAlter {
+		if len(indexDrops)+len(indexAdds) > 0 {
+			plan.ReplaceAttrs["indexes"] = struct{}{}
+		}
+		if len(projectionDrops)+len(projectionAdds) > 0 {
+			plan.ReplaceAttrs["projections"] = struct{}{}
+		}
+		if len(constraintDrops)+len(constraintAdds) > 0 {
+			plan.ReplaceAttrs["constraints"] = struct{}{}
+		}
+	}
+	metadataDrops := slices.Concat(indexDrops, projectionDrops, constraintDrops)
+	metadataAdds := slices.Concat(indexAdds, projectionAdds, constraintAdds)
+
 	tableActions := make([]string, 0)
 
 	if !expressionsEqual(current.SampleBy, desired.SampleBy) {
@@ -203,18 +222,24 @@ func planTableUpdate(current dbops.Table, desired dbops.Table, capabilities dbop
 	if len(columnPlan.renameActions) > 0 {
 		plan.ActionGroups = append(plan.ActionGroups, columnPlan.renameActions)
 	}
+	// Indexes, projections and constraints are dropped before the columns change and added
+	// after it, because their expressions can name added or dropped columns.
+	if len(metadataDrops) > 0 {
+		plan.ActionGroups = append(plan.ActionGroups, metadataDrops)
+	}
 	if len(columnPlan.addActions) > 0 {
 		plan.ActionGroups = append(plan.ActionGroups, columnPlan.addActions)
 	}
 	if len(columnPlan.modifyActions) > 0 {
 		plan.ActionGroups = append(plan.ActionGroups, columnPlan.modifyActions)
 	}
+	if len(metadataAdds) > 0 {
+		plan.ActionGroups = append(plan.ActionGroups, metadataAdds)
+	}
 	if len(tableActions) > 0 {
 		plan.ActionGroups = append(plan.ActionGroups, tableActions)
 	}
-	if len(settingsActions) > 0 {
-		plan.ActionGroups = append(plan.ActionGroups, settingsActions)
-	}
+	plan.ActionGroups = append(plan.ActionGroups, settingsActions...)
 	if len(columnPlan.dropActions) > 0 {
 		plan.ActionGroups = append(plan.ActionGroups, columnPlan.dropActions)
 	}
@@ -233,6 +258,7 @@ func buildEngineUpdateStrategy(capabilities dbops.TableEngineCapabilities) engin
 			allowSampleByAlter: true,
 			allowTTLAlter:      true,
 			allowOrderByAlter:  true,
+			allowIndexAlter:    true,
 		}
 	case tableengine.FamilyDistributed:
 		return engineUpdateStrategy{
@@ -313,12 +339,21 @@ func planColumnUpdate(current dbops.Table, desired dbops.Table, strategy engineU
 
 		positionChanged := !columnInDesiredPosition(currentOrder, desiredColumn.Name, previousName)
 		commentChanged := normalizeSQL(currentColumn.Comment) != normalizeSQL(desiredColumn.Comment)
-		typeChanged := normalizeSQL(currentColumn.Type) != normalizeSQL(desiredColumn.Type) || currentColumn.Nullable != desiredColumn.Nullable
+		typeChanged := !schemahelpers.TypesEqual(currentColumn.Type, currentColumn.Nullable, desiredColumn.Type, desiredColumn.Nullable)
+		codecChanged := !schemahelpers.SQLEqual(currentColumn.Codec, desiredColumn.Codec)
+		ttlChanged := !schemahelpers.SQLEqual(currentColumn.TTL, desiredColumn.TTL)
 		oldExpression := extractColumnExpression(currentColumn)
 		newExpression := extractColumnExpression(desiredColumn)
 		expressionChanged := oldExpression.kind != newExpression.kind || normalizeSQL(oldExpression.sql) != normalizeSQL(newExpression.sql)
 
-		if oldExpression.kind != "" && (oldExpression.kind != newExpression.kind || normalizeSQL(newExpression.sql) == "") {
+		if oldExpression.kind == querybuilder.ColumnExpressionKindEphemeral && oldExpression.kind != newExpression.kind {
+			// ClickHouse has no REMOVE EPHEMERAL. MODIFY COLUMN with another kind of
+			// expression replaces EPHEMERAL, but nothing makes the column ordinary again.
+			if newExpression.kind == "" {
+				result.replaceRequired = true
+				return result, nil
+			}
+		} else if oldExpression.kind != "" && (oldExpression.kind != newExpression.kind || normalizeSQL(newExpression.sql) == "") {
 			action, err := querybuilder.BuildRemoveColumnExpressionAction(desiredColumn.Name, oldExpression.kind)
 			if err != nil {
 				return columnUpdatePlan{}, err
@@ -326,7 +361,15 @@ func planColumnUpdate(current dbops.Table, desired dbops.Table, strategy engineU
 			result.modifyActions = append(result.modifyActions, action)
 		}
 
-		if typeChanged || positionChanged || (normalizeSQL(newExpression.sql) != "" && expressionChanged) {
+		if codecChanged && normalizeSQL(desiredColumn.Codec) == "" {
+			result.modifyActions = append(result.modifyActions, querybuilder.BuildRemoveColumnPropertyAction(desiredColumn.Name, "CODEC"))
+		}
+		if ttlChanged && normalizeSQL(desiredColumn.TTL) == "" {
+			result.modifyActions = append(result.modifyActions, querybuilder.BuildRemoveColumnPropertyAction(desiredColumn.Name, "TTL"))
+		}
+
+		if typeChanged || positionChanged || (normalizeSQL(newExpression.sql) != "" && expressionChanged) ||
+			(codecChanged && normalizeSQL(desiredColumn.Codec) != "") || (ttlChanged && normalizeSQL(desiredColumn.TTL) != "") {
 			position := (*querybuilder.ColumnPosition)(nil)
 			if positionChanged {
 				position = columnPositionFor(previousName)
@@ -462,7 +505,7 @@ func buildOrderByAlterAction(current string, desired string, addedColumns map[st
 	return action, true, nil
 }
 
-func planSettingsUpdate(current string, desired string, strategy engineUpdateStrategy, capabilities map[string]dbops.TableSettingCapability) ([]string, bool, error) {
+func planSettingsUpdate(current string, desired string, strategy engineUpdateStrategy, capabilities map[string]dbops.TableSettingCapability) ([][]string, bool, error) {
 	current = normalizeSQL(current)
 	desired = normalizeSQL(desired)
 	if current == desired {
@@ -484,7 +527,7 @@ func planSettingsUpdate(current string, desired string, strategy engineUpdateStr
 		return nil, true, nil
 	}
 
-	actions := make([]string, 0)
+	var modifyActions, resetActions []string
 	seen := make(map[string]struct{})
 
 	for _, setting := range desiredParsed.ordered {
@@ -500,7 +543,7 @@ func planSettingsUpdate(current string, desired string, strategy engineUpdateStr
 		if err != nil {
 			return nil, false, err
 		}
-		actions = append(actions, action)
+		modifyActions = append(modifyActions, action)
 	}
 
 	for _, setting := range currentParsed.ordered {
@@ -508,6 +551,11 @@ func planSettingsUpdate(current string, desired string, strategy engineUpdateStr
 			continue
 		}
 		capability, ok := capabilities[setting.Name]
+		// ClickHouse reports some read-only settings on every table, for example
+		// index_granularity. One that holds the server default is not a change.
+		if ok && capability.Known && capability.Readonly && strings.Trim(setting.Value, "'") == capability.Default {
+			continue
+		}
 		if !ok || !capability.Known || capability.Readonly {
 			return nil, true, nil
 		}
@@ -515,10 +563,28 @@ func planSettingsUpdate(current string, desired string, strategy engineUpdateStr
 		if err != nil {
 			return nil, false, err
 		}
-		actions = append(actions, action)
+		resetActions = append(resetActions, action)
 	}
 
-	return actions, false, nil
+	// Each group is one ALTER statement. ClickHouse reads everything after MODIFY SETTING or
+	// RESET SETTING as one list of settings, so each kind is a single action in its own statement.
+	var groups [][]string
+	if len(modifyActions) > 0 {
+		groups = append(groups, []string{mergeSettingActions("MODIFY SETTING ", modifyActions)})
+	}
+	if len(resetActions) > 0 {
+		groups = append(groups, []string{mergeSettingActions("RESET SETTING ", resetActions)})
+	}
+
+	return groups, false, nil
+}
+
+func mergeSettingActions(prefix string, actions []string) string {
+	merged := actions[0]
+	for _, action := range actions[1:] {
+		merged += ", " + strings.TrimPrefix(action, prefix)
+	}
+	return merged
 }
 
 func collectSettingNames(values ...string) []string {
@@ -686,6 +752,8 @@ func extractColumnExpression(column dbops.Column) columnExpression {
 		return columnExpression{kind: querybuilder.ColumnExpressionKindMaterialized, sql: *column.MaterializedExpression}
 	case column.AliasExpression != nil:
 		return columnExpression{kind: querybuilder.ColumnExpressionKindAlias, sql: *column.AliasExpression}
+	case column.EphemeralExpression != nil:
+		return columnExpression{kind: querybuilder.ColumnExpressionKindEphemeral, sql: *column.EphemeralExpression}
 	default:
 		return columnExpression{}
 	}
@@ -728,6 +796,9 @@ func collectExpressions(tables ...dbops.Table) []string {
 			}
 			if column.AliasExpression != nil {
 				expressions = append(expressions, normalizeSQL(*column.AliasExpression))
+			}
+			if column.EphemeralExpression != nil {
+				expressions = append(expressions, normalizeSQL(*column.EphemeralExpression))
 			}
 		}
 	}
@@ -860,7 +931,91 @@ func unwrapOuterParens(value string) string {
 }
 
 func normalizeSQL(value string) string {
-	return strings.TrimSpace(value)
+	return querybuilder.NormalizeSQL(value)
+}
+
+// planNamedChanges compares two lists of named definitions (indexes, projections,
+// constraints) by name, not by position. A changed definition is dropped and added again.
+func planNamedChanges[T any](current []T, desired []T, name func(T) string, equal func(T, T) bool, add func(T) string, drop func(string) string) ([]string, []string) {
+	currentByName := make(map[string]T, len(current))
+	for _, item := range current {
+		currentByName[name(item)] = item
+	}
+
+	var drops, adds []string
+	desiredNames := make(map[string]struct{}, len(desired))
+	for _, item := range desired {
+		desiredNames[name(item)] = struct{}{}
+		existing, exists := currentByName[name(item)]
+		if exists && equal(existing, item) {
+			continue
+		}
+		if exists {
+			drops = append(drops, drop(name(item)))
+		}
+		adds = append(adds, add(item))
+	}
+	for _, item := range current {
+		if _, ok := desiredNames[name(item)]; !ok {
+			drops = append(drops, drop(name(item)))
+		}
+	}
+
+	return drops, adds
+}
+
+// namedListsEqual compares two lists of named definitions by name, not by position.
+func namedListsEqual[T any](left []T, right []T, name func(T) string, equal func(T, T) bool) bool {
+	drops, adds := planNamedChanges(left, right, name, equal, func(T) string { return "" }, func(string) string { return "" })
+	return len(left) == len(right) && len(drops)+len(adds) == 0
+}
+
+func indexName(index dbops.Index) string { return index.Name }
+
+func indexEqual(left dbops.Index, right dbops.Index) bool {
+	return expressionsEqual(left.Expression, right.Expression) && expressionsEqual(left.Type, right.Type) &&
+		max(left.Granularity, 1) == max(right.Granularity, 1)
+}
+
+func projectionName(projection dbops.Projection) string { return projection.Name }
+
+func projectionEqual(left dbops.Projection, right dbops.Projection) bool {
+	return expressionsEqual(left.Query, right.Query) && expressionsEqual(left.Settings, right.Settings)
+}
+
+func constraintName(constraint dbops.Constraint) string { return constraint.Name }
+
+func constraintEqual(left dbops.Constraint, right dbops.Constraint) bool {
+	return expressionsEqual(left.Check, right.Check)
+}
+
+// filterUnmanaged removes the remote columns and indexes that match an unmanaged pattern
+// and are not declared in the configuration, so the provider never reports or changes them.
+func filterUnmanaged(remote dbops.Table, declared dbops.Table, columnPatterns []*regexp.Regexp, indexPatterns []*regexp.Regexp) dbops.Table {
+	declaredColumns := make(map[string]struct{}, len(declared.Columns))
+	for _, column := range declared.Columns {
+		declaredColumns[column.Name] = struct{}{}
+	}
+	declaredIndexes := make(map[string]struct{}, len(declared.Indexes))
+	for _, index := range declared.Indexes {
+		declaredIndexes[index.Name] = struct{}{}
+	}
+
+	unmanaged := func(name string, declared map[string]struct{}, patterns []*regexp.Regexp) bool {
+		if _, ok := declared[name]; ok {
+			return false
+		}
+		return slices.ContainsFunc(patterns, func(pattern *regexp.Regexp) bool { return pattern.MatchString(name) })
+	}
+
+	remote.Columns = slices.DeleteFunc(slices.Clone(remote.Columns), func(column dbops.Column) bool {
+		return unmanaged(column.Name, declaredColumns, columnPatterns)
+	})
+	remote.Indexes = slices.DeleteFunc(slices.Clone(remote.Indexes), func(index dbops.Index) bool {
+		return unmanaged(index.Name, declaredIndexes, indexPatterns)
+	})
+
+	return remote
 }
 
 func columnsEqualIgnoringName(left dbops.Column, right dbops.Column) bool {

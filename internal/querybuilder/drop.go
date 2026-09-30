@@ -29,6 +29,7 @@ type dropQueryBuilder struct {
 	resourceNameSQL  string
 	clusterName      *string
 	ifExists         bool
+	sync             bool
 }
 
 func NewDropRole(resourceName string) DropQueryBuilder {
@@ -93,9 +94,13 @@ func newDropQualified(resourceTypeName string, database string, name string) Dro
 		resourceNameSQL = qualifiedIdentifier(database, name)
 	}
 
+	// Schema objects are dropped with IF EXISTS ... SYNC: a replicated table that is dropped
+	// and created again in one apply must release its replica path in Keeper first.
 	return &dropQueryBuilder{
 		resourceTypeName: resourceTypeName,
 		resourceNameSQL:  resourceNameSQL,
+		ifExists:         true,
+		sync:             true,
 	}
 }
 
@@ -120,6 +125,9 @@ func (q *dropQueryBuilder) Build() (string, error) {
 
 	tokens = append(tokens, resourceNameSQL)
 	tokens = appendClusterClause(tokens, q.clusterName)
+	if q.sync {
+		tokens = append(tokens, "SYNC")
+	}
 
 	return strings.Join(tokens, " ") + ";", nil
 }

@@ -14,6 +14,14 @@ type impl struct {
 	readAfterWriteTimeout time.Duration
 	initOnce              sync.Once
 	initErr               error
+
+	host              string
+	adoptExisting     bool
+	ignoreColumnOrder bool
+	fanoutCluster     string
+	nodeFactory       NodeClientFactory
+	nodesMu           sync.Mutex
+	nodes             []SchemaNode
 }
 
 // ClientOption configures optional behaviour of the dbops client.
@@ -24,6 +32,36 @@ type ClientOption func(*impl)
 func WithReadAfterWriteTimeout(d time.Duration) ClientOption {
 	return func(i *impl) {
 		i.readAfterWriteTimeout = d
+	}
+}
+
+// WithHost sets the host name this client is connected to.
+func WithHost(host string) ClientOption {
+	return func(i *impl) {
+		i.host = host
+	}
+}
+
+// WithAdoptExisting lets schema object creation adopt objects that already exist.
+func WithAdoptExisting(adopt bool) ClientOption {
+	return func(i *impl) {
+		i.adoptExisting = adopt
+	}
+}
+
+// WithIgnoreColumnOrder stops tables from being altered only to move a column.
+func WithIgnoreColumnOrder(ignore bool) ClientOption {
+	return func(i *impl) {
+		i.ignoreColumnOrder = ignore
+	}
+}
+
+// WithFanout makes schema objects apply to every node of the cluster. The factory opens a
+// direct connection to one node.
+func WithFanout(cluster string, factory NodeClientFactory) ClientOption {
+	return func(i *impl) {
+		i.fanoutCluster = cluster
+		i.nodeFactory = factory
 	}
 }
 

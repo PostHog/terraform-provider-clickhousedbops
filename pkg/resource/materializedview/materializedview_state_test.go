@@ -20,18 +20,18 @@ func TestSyncMaterializedViewStateAppliesToTableSignatureDrift(t *testing.T) {
 	}
 
 	state := MaterializedViewResourceModel{
-		ToTable:   types.StringValue("posthog.events_rollup"),
+		ToTable:   types.StringValue("analytics.events_rollup"),
 		ToColumns: toColumns,
-		Query:     types.StringValue("SELECT team_id FROM posthog.events"),
+		Query:     types.StringValue("SELECT team_id FROM analytics.events"),
 	}
 
 	remote := &dbops.MaterializedView{
-		ToTable: "posthog.events_rollup",
+		ToTable: "analytics.events_rollup",
 		ToColumns: []dbops.Column{
 			{Name: "team_id", Type: "UInt64", Nullable: false},
 			{Name: "event_count", Type: "UInt64", Nullable: false},
 		},
-		Query: "SELECT team_id, count() AS event_count FROM posthog.events GROUP BY team_id",
+		Query: "SELECT team_id, count() AS event_count FROM analytics.events GROUP BY team_id",
 	}
 
 	diags = syncMaterializedViewState(ctx, &state, remote)
@@ -61,7 +61,7 @@ func TestSyncMaterializedViewStateSyncsPopulateFlag(t *testing.T) {
 		Engine:   "MergeTree()",
 		OrderBy:  "id",
 		Populate: false,
-		Query:    "SELECT id FROM posthog.events",
+		Query:    "SELECT id FROM analytics.events",
 	}
 
 	diags := syncMaterializedViewState(ctx, &state, remote)
@@ -85,7 +85,7 @@ func TestSyncMaterializedViewStateSyncsEngineBackedClauses(t *testing.T) {
 		SampleBy:    "team_id",
 		TTL:         "created_at + INTERVAL 1 DAY",
 		Settings:    "index_granularity = 8192",
-		Query:       "SELECT team_id, created_at FROM posthog.events",
+		Query:       "SELECT team_id, created_at FROM analytics.events",
 	}
 
 	diags := syncMaterializedViewState(ctx, &state, remote)
@@ -95,5 +95,32 @@ func TestSyncMaterializedViewStateSyncsEngineBackedClauses(t *testing.T) {
 
 	if state.Engine.ValueString() != remote.Engine || state.OrderBy.ValueString() != remote.OrderBy || state.Settings.ValueString() != remote.Settings {
 		t.Fatalf("expected engine-backed clauses to sync from remote, got %#v", state)
+	}
+}
+
+func TestSyncMaterializedViewStateKeepsConfiguredTextAndIgnoresInferredColumns(t *testing.T) {
+	query := "SELECT\n    team_id,\n    count() AS c\nFROM analytics.events\nGROUP BY team_id"
+	state := MaterializedViewResourceModel{
+		ToTable:   types.StringValue("analytics.events_rollup"),
+		ToColumns: types.ListNull(types.ObjectType{}),
+		Columns:   types.ListNull(types.ObjectType{}),
+		Query:     types.StringValue(query),
+	}
+
+	remote := &dbops.MaterializedView{
+		ToTable:   "analytics.events_rollup",
+		ToColumns: []dbops.Column{{Name: "team_id", Type: "UInt64"}, {Name: "c", Type: "UInt64"}},
+		Query:     "SELECT team_id, count() AS c FROM analytics.events GROUP BY team_id",
+	}
+
+	diags := syncMaterializedViewState(context.Background(), &state, remote)
+	if diags.HasError() {
+		t.Fatalf("syncMaterializedViewState() diagnostics = %v", diags)
+	}
+	if state.Query.ValueString() != query {
+		t.Fatalf("expected the configured query text to stay, got %q", state.Query.ValueString())
+	}
+	if !state.ToColumns.IsNull() {
+		t.Fatalf("expected the inferred to_columns list to be ignored, got %#v", state.ToColumns)
 	}
 }

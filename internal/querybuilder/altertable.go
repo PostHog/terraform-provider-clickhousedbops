@@ -18,6 +18,7 @@ const (
 	ColumnExpressionKindDefault      ColumnExpressionKind = "DEFAULT"
 	ColumnExpressionKindMaterialized ColumnExpressionKind = "MATERIALIZED"
 	ColumnExpressionKindAlias        ColumnExpressionKind = "ALIAS"
+	ColumnExpressionKindEphemeral    ColumnExpressionKind = "EPHEMERAL"
 )
 
 func FirstColumnPosition() *ColumnPosition {
@@ -57,9 +58,25 @@ func BuildAlterTable(database string, name string, clusterName *string, actions 
 		qualifiedIdentifier(database, name),
 	}
 	tokens = appendClusterClause(tokens, clusterName)
-	tokens = append(tokens, strings.Join(filtered, ", "))
+	// alter_sync = 2 makes a replicated ALTER return only when every replica has applied it.
+	tokens = append(tokens, strings.Join(filtered, ", "), "SETTINGS alter_sync = 2")
 
 	return strings.Join(tokens, " ") + ";", nil
+}
+
+// BuildModifyQuery builds the statement that changes the SELECT of a TO-table materialized view in place.
+func BuildModifyQuery(database string, name string, query string) (string, error) {
+	if err := validateRequiredField(database, "database", "ALTER TABLE"); err != nil {
+		return "", err
+	}
+	if err := validateRequiredField(name, "name", "ALTER TABLE"); err != nil {
+		return "", err
+	}
+	if err := validateRequiredField(query, "query", "ALTER TABLE"); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("ALTER TABLE %s MODIFY QUERY %s;", qualifiedIdentifier(database, name), strings.TrimSpace(query)), nil
 }
 
 func BuildAddColumnAction(column ColumnDefinition, position *ColumnPosition) (string, error) {
@@ -68,7 +85,7 @@ func BuildAddColumnAction(column ColumnDefinition, position *ColumnPosition) (st
 		return "", err
 	}
 
-	tokens := []string{"ADD", "COLUMN", definition}
+	tokens := []string{"ADD", "COLUMN", "IF", "NOT", "EXISTS", definition}
 	if positionClause := buildColumnPositionClause(position); positionClause != "" {
 		tokens = append(tokens, positionClause)
 	}
@@ -96,7 +113,7 @@ func BuildDropColumnAction(name string) (string, error) {
 		return "", errors.New("column name cannot be empty")
 	}
 
-	return fmt.Sprintf("DROP COLUMN %s", backtick(name)), nil
+	return fmt.Sprintf("DROP COLUMN IF EXISTS %s", backtick(name)), nil
 }
 
 func BuildRenameColumnAction(from string, to string) (string, error) {
@@ -144,6 +161,35 @@ func BuildRemoveColumnExpressionAction(name string, kind ColumnExpressionKind) (
 	}
 
 	return fmt.Sprintf("MODIFY COLUMN %s REMOVE %s", backtick(name), string(kind)), nil
+}
+
+// BuildRemoveColumnPropertyAction removes a CODEC or TTL from a column.
+func BuildRemoveColumnPropertyAction(name string, property string) string {
+	return fmt.Sprintf("MODIFY COLUMN %s REMOVE %s", backtick(strings.TrimSpace(name)), property)
+}
+
+func BuildAddIndexAction(index IndexDefinition) string {
+	return "ADD " + strings.Replace(index.SQL(), "INDEX", "INDEX IF NOT EXISTS", 1)
+}
+
+func BuildDropIndexAction(name string) string {
+	return fmt.Sprintf("DROP INDEX IF EXISTS %s", backtick(strings.TrimSpace(name)))
+}
+
+func BuildAddProjectionAction(projection ProjectionDefinition) string {
+	return "ADD " + strings.Replace(projection.SQL(), "PROJECTION", "PROJECTION IF NOT EXISTS", 1)
+}
+
+func BuildDropProjectionAction(name string) string {
+	return fmt.Sprintf("DROP PROJECTION IF EXISTS %s", backtick(strings.TrimSpace(name)))
+}
+
+func BuildAddConstraintAction(constraint ConstraintDefinition) string {
+	return "ADD " + strings.Replace(constraint.SQL(), "CONSTRAINT", "CONSTRAINT IF NOT EXISTS", 1)
+}
+
+func BuildDropConstraintAction(name string) string {
+	return fmt.Sprintf("DROP CONSTRAINT IF EXISTS %s", backtick(strings.TrimSpace(name)))
 }
 
 func BuildModifyOrderByAction(expr string) (string, error) {
@@ -237,12 +283,23 @@ func buildColumnDefinitionWithComment(column ColumnDefinition, includeComment bo
 		tokens = append(tokens, "ALIAS", strings.TrimSpace(*column.AliasExpression))
 	}
 
+	if !isNilOrEmpty(column.EphemeralExpression) {
+		expressionCount++
+		tokens = append(tokens, "EPHEMERAL", strings.TrimSpace(*column.EphemeralExpression))
+	}
+
 	if expressionCount > 1 {
-		return "", errors.New("only one of default_expression, materialized_expression, or alias_expression can be set for a column")
+		return "", errors.New("only one of default_expression, materialized_expression, alias_expression, or ephemeral_expression can be set for a column")
 	}
 
 	if includeComment && column.Comment != nil && strings.TrimSpace(*column.Comment) != "" {
 		tokens = append(tokens, "COMMENT", quote(strings.TrimSpace(*column.Comment)))
+	}
+	if strings.TrimSpace(column.Codec) != "" {
+		tokens = append(tokens, fmt.Sprintf("CODEC(%s)", strings.TrimSpace(column.Codec)))
+	}
+	if strings.TrimSpace(column.TTL) != "" {
+		tokens = append(tokens, "TTL", strings.TrimSpace(column.TTL))
 	}
 
 	return strings.Join(tokens, " "), nil
