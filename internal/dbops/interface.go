@@ -18,7 +18,7 @@ type Client interface {
 
 	CreateTable(ctx context.Context, table Table, clusterName *string) (*Table, error)
 	GetTable(ctx context.Context, database string, name string, clusterName *string) (*Table, error)
-	DeleteTable(ctx context.Context, database string, name string, clusterName *string) error
+	DeleteTable(ctx context.Context, database string, name string, clusterName *string, skipDependencyCheck bool) error
 	TableRows(ctx context.Context, database string, name string) (uint64, error)
 	FailingMutations(ctx context.Context, database string, name string) ([]FailingMutation, error)
 

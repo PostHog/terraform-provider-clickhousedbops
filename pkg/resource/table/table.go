@@ -58,8 +58,11 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		},
 		PlanModifiers: []planmodifier.String{
 			stringplanmodifier.RequiresReplaceIf(
-				func(_ context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
-					resp.RequiresReplace = !enginesEquivalent(req.StateValue.ValueString(), req.PlanValue.ValueString())
+				func(ctx context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+					var recreate types.Bool
+					resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("ignore_drop_dependencies"), &recreate)...)
+					// With ignore_drop_dependencies the update recreates the table itself.
+					resp.RequiresReplace = !recreate.ValueBool() && !enginesEquivalent(req.StateValue.ValueString(), req.PlanValue.ValueString())
 				},
 				"Replaces the table when the engine changes, ignoring formatting.",
 				"Replaces the table when the engine changes, ignoring formatting.",
@@ -126,6 +129,14 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		Default:  booldefault.StaticBool(false),
 		Description: "Allow dropping or replacing this table while a MergeTree-family engine holds rows on any node. " +
 			"The value in state counts, so set it to true and apply before the change that drops the table.",
+	}
+	attrs["ignore_drop_dependencies"] = schema.BoolAttribute{
+		Optional: true,
+		Computed: true,
+		Default:  booldefault.StaticBool(false),
+		Description: "Recreate the table in place when a change cannot be altered, instead of replacing it: the update drops it with check_table_dependencies = 0, " +
+			"which works while a dictionary or view reads from it, and creates it again. Dictionaries keep serving what they loaded until they reload. " +
+			"The configured value counts, also when the table is imported or adopted in the same apply. A Replicated table is still replaced, because its replicas cannot be recreated one at a time.",
 	}
 	resp.Schema = schema.Schema{
 		Attributes:          attrs,
@@ -252,6 +263,21 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
+	if !enginesEquivalent(currentTable.Engine, desiredTable.Engine) {
+		updatePlan.ReplaceAttrs["engine"] = struct{}{}
+	}
+	if len(updatePlan.ReplaceAttrs) > 0 && plan.IgnoreDropDependencies.ValueBool() {
+		resp.Diagnostics.Append(r.guardDataLoss(ctx, state, "recreate")...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		resp.Diagnostics.AddWarning(
+			"Table "+schemahelpers.QualifiedName(desiredTable.Database, desiredTable.Name)+" will be recreated",
+			fmt.Sprintf("%s cannot change in place, so the update drops the table with check_table_dependencies = 0 and creates it again. Dictionaries that read it keep serving what they loaded until they reload.",
+				strings.Join(slices.Sorted(maps.Keys(updatePlan.ReplaceAttrs)), ", ")),
+		)
+		return
+	}
 	for attr := range updatePlan.ReplaceAttrs {
 		resp.RequiresReplace = append(resp.RequiresReplace, path.Root(attr))
 	}
@@ -277,7 +303,9 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 		return
 	}
 
-	state, diags := r.convergeTable(ctx, plan, r.client.AdoptExisting())
+	// Adopting an existing table whose definition needs a replacement recreates it, when the
+	// configuration sets ignore_drop_dependencies.
+	state, diags := r.convergeTable(ctx, plan, r.client.AdoptExisting(), plan.IgnoreDropDependencies.ValueBool(), plan.ForceDestroy.ValueBool())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -345,23 +373,28 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 	}
 
 	newState.Nodes = nodes
-	// An imported table, or one from before force_destroy existed, gets the default, so that the
-	// first plan does not show it as a change.
+	// An imported table, or one from before these attributes existed, gets their defaults, so
+	// that the first plan does not show them as a change.
 	if newState.ForceDestroy.IsNull() {
 		newState.ForceDestroy = types.BoolValue(false)
+	}
+	if newState.IgnoreDropDependencies.IsNull() {
+		newState.IgnoreDropDependencies = types.BoolValue(false)
 	}
 	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, table.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
 	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan TableResourceModel
+	var plan, prior TableResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	state, diags := r.convergeTable(ctx, plan, true)
+	// force_destroy counts from state, as it does for a replacement.
+	state, diags := r.convergeTable(ctx, plan, true, plan.IgnoreDropDependencies.ValueBool(), prior.ForceDestroy.ValueBool())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -383,7 +416,7 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 	}
 
 	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
-		return client.DeleteTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+		return client.DeleteTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer(), state.IgnoreDropDependencies.ValueBool())
 	})...)
 }
 
@@ -411,6 +444,37 @@ func (r *Resource) checkMutations(ctx context.Context, database string, name str
 		}
 	}
 	return diags
+}
+
+// recreateOnNode drops a table that cannot be altered into the configured one and creates it
+// again. It keeps the data-loss guard: a MergeTree-family table with rows is only dropped with
+// force_destroy.
+func (r *Resource) recreateOnNode(ctx context.Context, node dbops.SchemaNode, desired dbops.Table, clusterName *string, forceDestroy bool) error {
+	existing, err := node.Client.GetTable(ctx, desired.Database, desired.Name, clusterName)
+	if err != nil {
+		return err
+	}
+	// Dropping one replica and creating it again under a changed definition would leave it
+	// disagreeing with the other replicas in Keeper; that takes a replacement of every replica.
+	if existing != nil && strings.HasPrefix(strings.ToLower(tableengine.BaseName(existing.Engine)), "replicated") {
+		return fmt.Errorf("the existing table is %s, which cannot be recreated one node at a time; replace it without ignore_drop_dependencies", tableengine.BaseName(existing.Engine))
+	}
+	if !forceDestroy {
+		if existing != nil && strings.HasSuffix(strings.ToLower(tableengine.BaseName(existing.Engine)), "mergetree") {
+			rows, err := node.Client.TableRows(ctx, desired.Database, desired.Name)
+			if err != nil {
+				return err
+			}
+			if rows > 0 {
+				return fmt.Errorf("the existing table holds %d rows, and recreating it loses them; set force_destroy = true to allow that", rows)
+			}
+		}
+	}
+	if err := node.Client.DeleteTable(ctx, desired.Database, desired.Name, clusterName, true); err != nil {
+		return err
+	}
+	_, err = node.Client.CreateTable(ctx, desired, clusterName)
+	return err
 }
 
 // guardDataLoss refuses to drop a MergeTree-family table that holds rows on any node, unless
@@ -455,7 +519,7 @@ func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequ
 
 // convergeTable makes every node hold the planned table: it alters existing tables in place
 // and creates the table where it is missing.
-func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, adopt bool) (*TableResourceModel, diag.Diagnostics) {
+func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, adopt bool, recreate bool, forceDestroy bool) (*TableResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
 	desired, err := expandTableModel(ctx, plan)
@@ -532,6 +596,9 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 			}
 			if !enginesEquivalent(remote.Engine, desired.Engine) {
 				updatePlan.ReplaceAttrs["engine"] = struct{}{}
+			}
+			if len(updatePlan.ReplaceAttrs) > 0 && recreate {
+				return r.recreateOnNode(ctx, node, desired, clusterName, forceDestroy)
 			}
 			if len(updatePlan.ReplaceAttrs) > 0 {
 				return fmt.Errorf("the table differs from the desired definition in attributes that cannot be changed in place: %s. Replace the table or change the configuration to match it",

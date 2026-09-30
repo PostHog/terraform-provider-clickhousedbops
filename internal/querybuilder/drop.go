@@ -21,6 +21,8 @@ type DropQueryBuilder interface {
 	QueryBuilder
 	WithCluster(clusterName *string) DropQueryBuilder
 	IfExists(ifExists bool) DropQueryBuilder
+	// SkipDependencyCheck drops the object even while a dictionary or view reads from it.
+	SkipDependencyCheck(skip bool) DropQueryBuilder
 }
 
 type dropQueryBuilder struct {
@@ -30,6 +32,7 @@ type dropQueryBuilder struct {
 	clusterName      *string
 	ifExists         bool
 	sync             bool
+	skipDependencies bool
 }
 
 func NewDropRole(resourceName string) DropQueryBuilder {
@@ -75,6 +78,11 @@ func (q *dropQueryBuilder) WithCluster(clusterName *string) DropQueryBuilder {
 
 func (q *dropQueryBuilder) IfExists(ifExists bool) DropQueryBuilder {
 	q.ifExists = ifExists
+	return q
+}
+
+func (q *dropQueryBuilder) SkipDependencyCheck(skip bool) DropQueryBuilder {
+	q.skipDependencies = skip
 	return q
 }
 
@@ -127,6 +135,9 @@ func (q *dropQueryBuilder) Build() (string, error) {
 	tokens = appendClusterClause(tokens, q.clusterName)
 	if q.sync {
 		tokens = append(tokens, "SYNC")
+	}
+	if q.skipDependencies {
+		tokens = append(tokens, "SETTINGS", "check_table_dependencies", "=", "0")
 	}
 
 	return strings.Join(tokens, " ") + ";", nil

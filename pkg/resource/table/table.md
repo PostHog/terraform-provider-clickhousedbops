@@ -17,6 +17,8 @@ Column changes use `ADD COLUMN IF NOT EXISTS` and `DROP COLUMN IF EXISTS`. Every
 
 A change that drops the table, a destroy or a replacement, is refused while a MergeTree-family table holds rows on any node. The plan fails and names the nodes and their row counts. To drop the data on purpose, set `force_destroy = true` and apply that change on its own first: the value in state counts, so setting it in the same plan as the replacement is refused too.
 
+ClickHouse refuses to drop a table that a dictionary or view reads from, so replacing such a table fails. With `ignore_drop_dependencies = true`, a change that cannot be altered in place recreates the table within the update instead: it drops the table with `check_table_dependencies = 0` and creates it again, and the plan shows an in-place update with a warning. The configured value counts, so this works in the same apply that imports or adopts the table. The data-loss guard still applies, and an existing `Replicated*` table is refused, because its replicas cannot be recreated one node at a time.
+
 A mutation that keeps failing on the table fails every plan of it, with the `KILL MUTATION` statement that stops it. Its `ALTER` already changed the metadata, so without this the table would look up to date while its data is not.
 
 `unmanaged_columns` and `unmanaged_indexes` are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.

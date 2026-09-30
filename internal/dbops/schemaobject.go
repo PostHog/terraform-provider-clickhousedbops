@@ -183,12 +183,14 @@ func (i *impl) deleteIfExists(ctx context.Context, exists bool, dropBuilder quer
 	return nil
 }
 
-func (i *impl) DeleteTable(ctx context.Context, database string, name string, clusterName *string) error {
+// DeleteTable drops the table. With skipDependencyCheck it drops it even while a dictionary or
+// view reads from it, which a replacement needs: the table is created again right after.
+func (i *impl) DeleteTable(ctx context.Context, database string, name string, clusterName *string, skipDependencyCheck bool) error {
 	table, err := i.GetTable(ctx, database, name, clusterName)
 	if err != nil {
 		return err
 	}
-	return i.deleteIfExists(ctx, table != nil, querybuilder.NewDropTable(database, name).WithCluster(clusterName))
+	return i.deleteIfExists(ctx, table != nil, querybuilder.NewDropTable(database, name).WithCluster(clusterName).SkipDependencyCheck(skipDependencyCheck))
 }
 
 // TableRows returns the rows the table holds on this node; 0 when it does not exist.
