@@ -513,7 +513,13 @@ func syncTableState(ctx context.Context, state *TableResourceModel, table *dbops
 	state.Engine = syncEquivalentString(state.Engine, table.Engine, enginesEquivalent)
 	state.PartitionBy = syncEquivalentString(state.PartitionBy, table.PartitionBy, expressionsEqual)
 	state.OrderBy = syncEquivalentString(state.OrderBy, table.OrderBy, expressionListsEqual)
-	state.PrimaryKey = syncManagedEquivalentString(state.PrimaryKey, table.PrimaryKey, expressionListsEqual)
+	// A primary key that repeats the sorting key says nothing, and is not taken into state
+	// when the configuration does not set one.
+	if state.PrimaryKey.IsNull() && expressionListsEqual(table.PrimaryKey, table.OrderBy) {
+		state.PrimaryKey = types.StringNull()
+	} else {
+		state.PrimaryKey = syncEquivalentString(state.PrimaryKey, table.PrimaryKey, expressionListsEqual)
+	}
 	state.SampleBy = syncEquivalentString(state.SampleBy, table.SampleBy, expressionsEqual)
 	state.TTL = syncEquivalentString(state.TTL, table.TTL, ttlExpressionsEqual)
 	state.Settings = syncRemoteSettings(state.Settings, table.Settings, settingCapabilities)
@@ -531,19 +537,6 @@ func syncTableState(ctx context.Context, state *TableResourceModel, table *dbops
 
 func syncEquivalentString(current types.String, remote string, equal func(string, string) bool) types.String {
 	if !current.IsNull() && !current.IsUnknown() && equal(current.ValueString(), remote) {
-		return current
-	}
-	if normalizeSQL(remote) == "" {
-		return types.StringNull()
-	}
-	return types.StringValue(remote)
-}
-
-func syncManagedEquivalentString(current types.String, remote string, equal func(string, string) bool) types.String {
-	if !current.IsNull() && !current.IsUnknown() && equal(current.ValueString(), remote) {
-		return current
-	}
-	if current.IsNull() || (!current.IsUnknown() && normalizeSQL(current.ValueString()) == "") {
 		return current
 	}
 	if normalizeSQL(remote) == "" {

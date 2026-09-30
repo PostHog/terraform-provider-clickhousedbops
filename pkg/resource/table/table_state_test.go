@@ -136,6 +136,7 @@ func TestSyncTableStateIgnoresImplicitPrimaryKeyWhenUnset(t *testing.T) {
 
 	remote := &dbops.Table{
 		PrimaryKey: "id",
+		OrderBy:    "id",
 	}
 
 	diags := syncTableState(ctx, &state, remote, nil)
@@ -144,6 +145,16 @@ func TestSyncTableStateIgnoresImplicitPrimaryKeyWhenUnset(t *testing.T) {
 	}
 	if !state.PrimaryKey.IsNull() {
 		t.Fatalf("expected implicit primary key to be ignored, got %q", state.PrimaryKey.ValueString())
+	}
+
+	// A primary key shorter than the sorting key is a real part of the definition.
+	state = TableResourceModel{PrimaryKey: types.StringNull()}
+	diags = syncTableState(ctx, &state, &dbops.Table{PrimaryKey: "id", OrderBy: "(id, ts)"}, nil)
+	if diags.HasError() {
+		t.Fatalf("syncTableState() diagnostics = %v", diags)
+	}
+	if state.PrimaryKey.ValueString() != "id" {
+		t.Fatalf("expected the explicit primary key in state, got %q", state.PrimaryKey.ValueString())
 	}
 }
 
