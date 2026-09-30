@@ -136,7 +136,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		Default:  booldefault.StaticBool(false),
 		Description: "Recreate the table in place when a change cannot be altered, instead of replacing it: the update drops it with check_table_dependencies = 0, " +
 			"which works while a dictionary or view reads from it, and creates it again. Dictionaries keep serving what they loaded until they reload. " +
-			"The configured value counts, also when the table is imported or adopted in the same apply. A Replicated table is still replaced, because its replicas cannot be recreated one at a time.",
+			"The configured value counts, also when the table is imported or adopted in the same apply, and so does force_destroy on this path. A Replicated table can be recreated as a local table, but not as a Replicated one.",
 	}
 	resp.Schema = schema.Schema{
 		Attributes:          attrs,
@@ -267,7 +267,10 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		updatePlan.ReplaceAttrs["engine"] = struct{}{}
 	}
 	if len(updatePlan.ReplaceAttrs) > 0 && plan.IgnoreDropDependencies.ValueBool() {
-		resp.Diagnostics.Append(r.guardDataLoss(ctx, state, "recreate")...)
+		// A recreate is configured, so the configured force_destroy decides whether it may lose rows.
+		guarded := state
+		guarded.ForceDestroy = plan.ForceDestroy
+		resp.Diagnostics.Append(r.guardDataLoss(ctx, guarded, "recreate")...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
@@ -386,15 +389,15 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan, prior TableResourceModel
+	var plan TableResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// force_destroy counts from state, as it does for a replacement.
-	state, diags := r.convergeTable(ctx, plan, true, plan.IgnoreDropDependencies.ValueBool(), prior.ForceDestroy.ValueBool())
+	// A recreate is configured, so its force_destroy counts from the configuration too; the
+	// plan already showed the refusal or the warning.
+	state, diags := r.convergeTable(ctx, plan, true, plan.IgnoreDropDependencies.ValueBool(), plan.ForceDestroy.ValueBool())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -454,10 +457,12 @@ func (r *Resource) recreateOnNode(ctx context.Context, node dbops.SchemaNode, de
 	if err != nil {
 		return err
 	}
-	// Dropping one replica and creating it again under a changed definition would leave it
+	// Recreating one replica of a Replicated table as another Replicated table would leave it
 	// disagreeing with the other replicas in Keeper; that takes a replacement of every replica.
-	if existing != nil && strings.HasPrefix(strings.ToLower(tableengine.BaseName(existing.Engine)), "replicated") {
-		return fmt.Errorf("the existing table is %s, which cannot be recreated one node at a time; replace it without ignore_drop_dependencies", tableengine.BaseName(existing.Engine))
+	// A replica recreated as a local table leaves Keeper, because the drop is SYNC.
+	isReplicated := func(engine string) bool { return strings.HasPrefix(strings.ToLower(tableengine.BaseName(engine)), "replicated") }
+	if existing != nil && isReplicated(existing.Engine) && isReplicated(desired.Engine) {
+		return fmt.Errorf("the existing table is %s, which cannot be recreated as a Replicated table one node at a time; replace it without ignore_drop_dependencies", tableengine.BaseName(existing.Engine))
 	}
 	if !forceDestroy {
 		if existing != nil && strings.HasSuffix(strings.ToLower(tableengine.BaseName(existing.Engine)), "mergetree") {
