@@ -78,7 +78,7 @@ resource "clickhousedbops_dictionary" "teams" {
 - `lifetime` (String) Raw LIFETIME clause body, for example 0 or MIN 0 MAX 300
 - `name` (String) Dictionary name
 - `primary_key` (List of String) Ordered list of attribute names used in the PRIMARY KEY clause
-- `source` (String) Raw SOURCE clause body, for example CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'analytics' TABLE 'teams_source') or NULL(). ClickHouse hides the PASSWORD value when it reports the dictionary, so a change of only the password is not detected.
+- `source` (String, Sensitive) Raw SOURCE clause body, for example CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'analytics' TABLE 'teams_source') or NULL(). ClickHouse hides the PASSWORD value when it reports the dictionary, so a change of only the password is not detected.
 
 ### Optional
 

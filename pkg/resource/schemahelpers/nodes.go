@@ -225,3 +225,41 @@ func hostList(hosts []string) types.List {
 	list, _ := types.ListValueFrom(context.Background(), types.StringType, values)
 	return list
 }
+
+// EquivalentString pairs a planned SQL attribute with its value in state.
+type EquivalentString struct {
+	Attribute string
+	Planned   types.String
+	State     types.String
+	// Equal compares the two texts; nil compares them as SQL, ignoring whitespace.
+	Equal func(planned string, state string) bool
+}
+
+// KeepEquivalentStrings makes every planned attribute whose text means the same as the text
+// in state keep the state's text, so that formatting differences do not show as changes. When
+// all of them are equivalent and the node list is unchanged, nothing will run, and the create
+// statement keeps its value too.
+func KeepEquivalentStrings(ctx context.Context, plan *tfsdk.Plan, stateNodes types.List, stateCreateStatement types.String, attributes []EquivalentString) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	unchanged := true
+	for _, attribute := range attributes {
+		equal := attribute.Equal
+		if equal == nil {
+			equal = SQLEqual
+		}
+		if attribute.Planned.IsUnknown() || !equal(attribute.Planned.ValueString(), attribute.State.ValueString()) {
+			unchanged = false
+			continue
+		}
+		diags.Append(plan.SetAttribute(ctx, path.Root(attribute.Attribute), attribute.State)...)
+	}
+
+	var plannedNodes types.List
+	diags.Append(plan.GetAttribute(ctx, path.Root("nodes"), &plannedNodes)...)
+	if unchanged && plannedNodes.Equal(stateNodes) {
+		diags.Append(plan.SetAttribute(ctx, path.Root("create_statement"), stateCreateStatement)...)
+	}
+
+	return diags
+}

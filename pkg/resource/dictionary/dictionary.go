@@ -123,6 +123,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 		},
 	}
 	attrs["source"] = schema.StringAttribute{
+		Sensitive:   true,
 		Required:    true,
 		Description: "Raw SOURCE clause body, for example CLICKHOUSE(HOST 'localhost' PORT tcpPort() USER 'default' PASSWORD 'test' DB 'analytics' TABLE 'teams_source') or NULL(). ClickHouse hides the PASSWORD value when it reports the dictionary, so a change of only the password is not detected.",
 		Validators: []validator.String{
@@ -190,6 +191,36 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	}
 
 	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, clusterName, &resp.Plan)...)
+	if resp.Diagnostics.HasError() || req.State.Raw.IsNull() {
+		return
+	}
+
+	var plan, state DictionaryResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	planned, err := expandDictionaryModel(ctx, plan)
+	if err != nil {
+		return
+	}
+	current, err := expandDictionaryModel(ctx, state)
+	if err != nil {
+		return
+	}
+	if !attributesEqual(planned.Attributes, current.Attributes) || !slices.Equal(planned.PrimaryKey, current.PrimaryKey) || !plan.Comment.Equal(state.Comment) {
+		return
+	}
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("attributes"), state.Attributes)...)
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("primary_key"), state.PrimaryKey)...)
+	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.Nodes, state.CreateStatement, []schemahelpers.EquivalentString{
+		{Attribute: "source", Planned: plan.Source, State: state.Source, Equal: sourcesEqual},
+		{Attribute: "layout", Planned: plan.Layout, State: state.Layout},
+		{Attribute: "lifetime", Planned: plan.Lifetime, State: state.Lifetime},
+		{Attribute: "range", Planned: plan.Range, State: state.Range},
+		{Attribute: "settings", Planned: plan.Settings, State: state.Settings},
+	})...)
 }
 
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

@@ -254,6 +254,20 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	if (plan.ToTable.IsNull() || !plan.ClusterName.IsNull()) && !schemahelpers.SQLEqual(plan.Query.ValueString(), state.Query.ValueString()) {
 		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("query"))
 	}
+	if resp.Diagnostics.HasError() || !plan.Columns.Equal(state.Columns) || !plan.ToColumns.Equal(state.ToColumns) || !plan.Populate.Equal(state.Populate) {
+		return
+	}
+	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.Nodes, state.CreateStatement, []schemahelpers.EquivalentString{
+		{Attribute: "query", Planned: plan.Query, State: state.Query},
+		{Attribute: "to_table", Planned: plan.ToTable, State: state.ToTable},
+		{Attribute: "engine", Planned: plan.Engine, State: state.Engine},
+		{Attribute: "partition_by", Planned: plan.PartitionBy, State: state.PartitionBy},
+		{Attribute: "order_by", Planned: plan.OrderBy, State: state.OrderBy},
+		{Attribute: "primary_key", Planned: plan.PrimaryKey, State: state.PrimaryKey},
+		{Attribute: "sample_by", Planned: plan.SampleBy, State: state.SampleBy},
+		{Attribute: "ttl", Planned: plan.TTL, State: state.TTL},
+		{Attribute: "settings", Planned: plan.Settings, State: state.Settings},
+	})...)
 }
 
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

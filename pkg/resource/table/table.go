@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -201,6 +202,37 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
+	// An attribute whose configured text means the same as the text in state keeps the state's
+	// text, so that formatting, column order and default settings do not show as changes.
+	keep := func(attr string, equivalent bool, value attr.Value, apply func()) {
+		if !equivalent {
+			return
+		}
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root(attr), value)...)
+		apply()
+	}
+	keep("engine", enginesEquivalent(currentTable.Engine, desiredTable.Engine), state.Engine, func() { desiredTable.Engine = currentTable.Engine })
+	keep("partition_by", expressionsEqual(currentTable.PartitionBy, desiredTable.PartitionBy), state.PartitionBy, func() { desiredTable.PartitionBy = currentTable.PartitionBy })
+	keep("order_by", expressionListsEqual(currentTable.OrderBy, desiredTable.OrderBy), state.OrderBy, func() { desiredTable.OrderBy = currentTable.OrderBy })
+	keep("primary_key", expressionListsEqual(currentTable.PrimaryKey, desiredTable.PrimaryKey), state.PrimaryKey, func() { desiredTable.PrimaryKey = currentTable.PrimaryKey })
+	keep("sample_by", expressionsEqual(currentTable.SampleBy, desiredTable.SampleBy), state.SampleBy, func() { desiredTable.SampleBy = currentTable.SampleBy })
+	keep("ttl", ttlExpressionsEqual(currentTable.TTL, desiredTable.TTL), state.TTL, func() { desiredTable.TTL = currentTable.TTL })
+	keep("as_select", expressionsEqual(currentTable.AsSelect, desiredTable.AsSelect), state.AsSelect, func() { desiredTable.AsSelect = currentTable.AsSelect })
+	if syncRemoteSettings(state.Settings, desiredTable.Settings, settingCapabilities).Equal(state.Settings) {
+		// Terraform does not accept a planned null for an attribute the configuration sets.
+		if !state.Settings.IsNull() || plan.Settings.IsNull() {
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("settings"), state.Settings)...)
+		}
+		desiredTable.Settings = currentTable.Settings
+	}
+	keep("columns", schemahelpers.ColumnsEqual(currentTable.Columns, desiredTable.Columns), state.Columns, func() { desiredTable.Columns = currentTable.Columns })
+	keep("indexes", namedListsEqual(currentTable.Indexes, desiredTable.Indexes, indexName, indexEqual), state.Indexes, func() { desiredTable.Indexes = currentTable.Indexes })
+	keep("projections", namedListsEqual(currentTable.Projections, desiredTable.Projections, projectionName, projectionEqual), state.Projections, func() { desiredTable.Projections = currentTable.Projections })
+	keep("constraints", namedListsEqual(currentTable.Constraints, desiredTable.Constraints, constraintName, constraintEqual), state.Constraints, func() { desiredTable.Constraints = currentTable.Constraints })
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	updatePlan, err := planTableUpdate(currentTable, desiredTable, capabilities, settingCapabilities)
 	if err != nil {
 		resp.Diagnostics.AddError("Error planning table update", fmt.Sprintf("%+v\n", err))
@@ -209,6 +241,13 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 
 	for attr := range updatePlan.ReplaceAttrs {
 		resp.RequiresReplace = append(resp.RequiresReplace, path.Root(attr))
+	}
+
+	// Nothing to run on any node: the create statement stays what it is.
+	var plannedNodes types.List
+	resp.Diagnostics.Append(resp.Plan.GetAttribute(ctx, path.Root("nodes"), &plannedNodes)...)
+	if len(updatePlan.ReplaceAttrs) == 0 && len(updatePlan.ActionGroups) == 0 && plannedNodes.Equal(state.Nodes) {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), state.CreateStatement)...)
 	}
 }
 
@@ -565,7 +604,7 @@ func settingsAppearToBeDefaults(raw string, capabilities map[string]dbops.TableS
 
 	for _, setting := range parsed.ordered {
 		capability, ok := capabilities[setting.Name]
-		if !ok || !capability.Known || !capability.Readonly {
+		if !ok || !capability.Known || !capability.Readonly || normalizeSQL(capability.Default) != normalizeSQL(setting.Value) {
 			return false
 		}
 	}

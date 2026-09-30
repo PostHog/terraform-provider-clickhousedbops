@@ -118,7 +118,7 @@ func TestSyncTableStateIgnoresDefaultReadonlySettingsWhenUnset(t *testing.T) {
 	}
 
 	diags := syncTableState(ctx, &state, remote, map[string]dbops.TableSettingCapability{
-		"index_granularity": {Name: "index_granularity", Known: true, Readonly: true},
+		"index_granularity": {Name: "index_granularity", Known: true, Readonly: true, Default: "8192"},
 	})
 	if diags.HasError() {
 		t.Fatalf("syncTableState() diagnostics = %v", diags)
