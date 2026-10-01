@@ -123,6 +123,7 @@ func (i *impl) GetDictionary(ctx context.Context, database string, name string, 
 	if err != nil {
 		return nil, errors.WithMessage(err, "error building query")
 	}
+	showCreateSQL = i.withSecretsShown(showCreateSQL)
 
 	err = i.clickhouseClient.Select(ctx, showCreateSQL, func(data clickhouseclient.Row) error {
 		statement, err := data.GetString("statement")
@@ -134,6 +135,9 @@ func (i *impl) GetDictionary(ctx context.Context, database string, name string, 
 	})
 	if err != nil {
 		return nil, errors.WithMessage(err, "error running SHOW CREATE DICTIONARY")
+	}
+	if i.manageDictPasswords && strings.Contains(dictionary.CreateStatement, "'[HIDDEN]'") {
+		return nil, errors.Errorf("ClickHouse hid the password of %s.%s although manage_dictionary_passwords is set: the server needs display_secrets_in_show_and_select = 1 in its config, and the provider's user the displaySecretsInShowAndSelect privilege", database, name)
 	}
 
 	if dictionary.CreateStatement == "" {

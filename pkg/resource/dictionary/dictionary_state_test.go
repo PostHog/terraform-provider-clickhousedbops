@@ -63,7 +63,7 @@ func TestSyncDictionaryStateKeepsEquivalentConfiguration(t *testing.T) {
 		Range:      "MIN start MAX end",
 	}
 
-	if diags := syncDictionaryState(ctx, &state, remote); diags.HasError() {
+	if diags := syncDictionaryState(ctx, &state, remote, sourcesEqual); diags.HasError() {
 		t.Fatalf("syncDictionaryState() diagnostics = %v", diags)
 	}
 	if !state.Source.Equal(before.Source) || !state.Attributes.Equal(before.Attributes) || !state.Range.Equal(before.Range) {
@@ -72,7 +72,7 @@ func TestSyncDictionaryStateKeepsEquivalentConfiguration(t *testing.T) {
 
 	remote.Attributes[1].Type = "String"
 	remote.Range = ""
-	if diags := syncDictionaryState(ctx, &state, remote); diags.HasError() {
+	if diags := syncDictionaryState(ctx, &state, remote, sourcesEqual); diags.HasError() {
 		t.Fatalf("syncDictionaryState() diagnostics = %v", diags)
 	}
 	if state.Attributes.Equal(before.Attributes) || !state.Range.IsNull() {

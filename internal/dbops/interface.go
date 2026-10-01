@@ -46,6 +46,7 @@ type Client interface {
 	FanoutCluster() string
 	AdoptExisting() bool
 	IgnoreColumnOrder() bool
+	ManageDictionaryPasswords() bool
 
 	CreateRole(ctx context.Context, role Role, clusterName *string) (*Role, error)
 	GetRole(ctx context.Context, id string, clusterName *string) (*Role, error)

@@ -159,6 +159,12 @@ func (p *Provider) Schema(ctx context.Context, req provider.SchemaRequest, resp 
 				Optional:    true,
 				Description: "When true, a table whose columns match the configuration in a different order is not altered. New columns are still added after the column that precedes them in the configuration.",
 			},
+			"manage_dictionary_passwords": schema.BoolAttribute{
+				Optional: true,
+				Description: "When true, the password in a dictionary source is read and compared like the rest of the source, so a wrong or missing password shows as a change. " +
+					"It reads with format_display_secrets_in_show_and_select = 1, which needs display_secrets_in_show_and_select in the server config and the displaySecretsInShowAndSelect privilege for the provider's user; reading fails with an error otherwise. " +
+					"When false (the default), passwords are not compared, because ClickHouse reports them as [HIDDEN].",
+			},
 			"query_timeout": schema.Int64Attribute{
 				Optional:    true,
 				Description: "Timeout in seconds for each query ran against ClickHouse. Defaults to 300.",
@@ -352,6 +358,7 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 		dbops.WithHost(data.Host.ValueString()),
 		dbops.WithAdoptExisting(data.AdoptExisting.ValueBool()),
 		dbops.WithIgnoreColumnOrder(data.IgnoreColumnOrder.ValueBool()),
+		dbops.WithManageDictionaryPasswords(data.ManageDictPasswords.ValueBool()),
 	}
 	if !data.ReadAfterWriteTimeout.IsNull() {
 		dbopsOpts = append(dbopsOpts, dbops.WithReadAfterWriteTimeout(time.Duration(data.ReadAfterWriteTimeout.ValueInt64())*time.Second))

@@ -15,13 +15,14 @@ type impl struct {
 	initOnce              sync.Once
 	initErr               error
 
-	host              string
-	adoptExisting     bool
-	ignoreColumnOrder bool
-	fanoutCluster     string
-	nodeFactory       NodeClientFactory
-	nodesMu           sync.Mutex
-	nodes             []SchemaNode
+	host                string
+	adoptExisting       bool
+	ignoreColumnOrder   bool
+	manageDictPasswords bool
+	fanoutCluster       string
+	nodeFactory         NodeClientFactory
+	nodesMu             sync.Mutex
+	nodes               []SchemaNode
 }
 
 // ClientOption configures optional behaviour of the dbops client.
@@ -53,6 +54,14 @@ func WithAdoptExisting(adopt bool) ClientOption {
 func WithIgnoreColumnOrder(ignore bool) ClientOption {
 	return func(i *impl) {
 		i.ignoreColumnOrder = ignore
+	}
+}
+
+// WithManageDictionaryPasswords reads schema objects with their secrets shown, so that a
+// dictionary source is compared with its password instead of PASSWORD '[HIDDEN]'.
+func WithManageDictionaryPasswords(manage bool) ClientOption {
+	return func(i *impl) {
+		i.manageDictPasswords = manage
 	}
 }
 

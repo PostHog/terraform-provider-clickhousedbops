@@ -377,6 +377,16 @@ func (i *impl) DeleteMaterializedView(ctx context.Context, database string, name
 	return i.deleteIfExists(ctx, view != nil, querybuilder.NewDropMaterializedView(database, name).WithCluster(clusterName))
 }
 
+// withSecretsShown makes a query that reads object definitions show their secrets, when the
+// provider manages dictionary passwords. It needs display_secrets_in_show_and_select in the server
+// config and the displaySecretsInShowAndSelect privilege; without them ClickHouse still hides them.
+func (i *impl) withSecretsShown(sql string) string {
+	if !i.manageDictPasswords {
+		return sql
+	}
+	return strings.TrimSuffix(sql, ";") + " SETTINGS format_display_secrets_in_show_and_select = 1;"
+}
+
 func (i *impl) getSchemaObject(ctx context.Context, database string, name string, clusterName *string, kind schemaObjectKind) (*schemaObject, error) {
 	whereConditions := []querybuilder.Where{
 		querybuilder.WhereEquals("database", database),
@@ -407,6 +417,7 @@ func (i *impl) getSchemaObject(ctx context.Context, database string, name string
 	if err != nil {
 		return nil, errors.WithMessage(err, "error building query")
 	}
+	sql = i.withSecretsShown(sql)
 
 	var object *schemaObject
 

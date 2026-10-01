@@ -34,6 +34,10 @@ func (i *impl) IgnoreColumnOrder() bool {
 	return i.ignoreColumnOrder
 }
 
+func (i *impl) ManageDictionaryPasswords() bool {
+	return i.manageDictPasswords
+}
+
 func (i *impl) SchemaNodes(ctx context.Context) ([]SchemaNode, error) {
 	if i.fanoutCluster == "" {
 		return []SchemaNode{{Host: i.host, ShardNum: 1, ReplicaNum: 1, Client: i}}, nil
@@ -117,6 +121,7 @@ func (i *impl) SchemaNodes(ctx context.Context) ([]SchemaNode, error) {
 			host:                  node.Host,
 			adoptExisting:         i.adoptExisting,
 			ignoreColumnOrder:     i.ignoreColumnOrder,
+			manageDictPasswords:   i.manageDictPasswords,
 		}
 		nodes = append(nodes, node.SchemaNode)
 	}

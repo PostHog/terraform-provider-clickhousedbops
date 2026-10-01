@@ -17,6 +17,7 @@ type Model struct {
 	FanoutCluster         types.String `tfsdk:"fanout_cluster"`
 	AdoptExisting         types.Bool   `tfsdk:"adopt_existing"`
 	IgnoreColumnOrder     types.Bool   `tfsdk:"ignore_column_order"`
+	ManageDictPasswords   types.Bool   `tfsdk:"manage_dictionary_passwords"`
 }
 
 type AuthConfig struct {

@@ -215,7 +215,7 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("attributes"), state.Attributes)...)
 	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("primary_key"), state.PrimaryKey)...)
 	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.Nodes, state.CreateStatement, []schemahelpers.EquivalentString{
-		{Attribute: "source", Planned: plan.Source, State: state.Source, Equal: sourcesEqual},
+		{Attribute: "source", Planned: plan.Source, State: state.Source, Equal: r.sourceComparison()},
 		{Attribute: "layout", Planned: plan.Layout, State: state.Layout},
 		{Attribute: "lifetime", Planned: plan.Lifetime, State: state.Lifetime},
 		{Attribute: "range", Planned: plan.Range, State: state.Range},
@@ -250,7 +250,9 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		func(ctx context.Context, client dbops.Client) (*dbops.Dictionary, error) {
 			return client.GetDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
 		},
-		syncDictionaryState,
+		func(ctx context.Context, state *DictionaryResourceModel, dict *dbops.Dictionary) diag.Diagnostics {
+			return syncDictionaryState(ctx, state, dict, r.sourceComparison())
+		},
 	)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -322,7 +324,7 @@ func (r *Resource) convergeDictionary(ctx context.Context, plan DictionaryResour
 		},
 		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.Dictionary) error {
 			candidate := plan
-			if syncDiags := syncDictionaryState(ctx, &candidate, existing); syncDiags.HasError() {
+			if syncDiags := syncDictionaryState(ctx, &candidate, existing, r.sourceComparison()); syncDiags.HasError() {
 				return schemahelpers.DiagnosticsError(syncDiags)
 			}
 			if reflect.DeepEqual(candidate, plan) {
@@ -355,11 +357,24 @@ func sourcesEqual(left string, right string) bool {
 	return mask(left) == mask(right)
 }
 
-func syncDictionaryState(ctx context.Context, state *DictionaryResourceModel, dict *dbops.Dictionary) diag.Diagnostics {
+// sourcesEqualWithPasswords compares two SOURCE clause bodies as written, password included.
+func sourcesEqualWithPasswords(left string, right string) bool {
+	return querybuilder.NormalizeSQL(left) == querybuilder.NormalizeSQL(right)
+}
+
+// sourceComparison is how the provider compares sources: with passwords when it manages them.
+func (r *Resource) sourceComparison() func(string, string) bool {
+	if r.client != nil && r.client.ManageDictionaryPasswords() {
+		return sourcesEqualWithPasswords
+	}
+	return sourcesEqual
+}
+
+func syncDictionaryState(ctx context.Context, state *DictionaryResourceModel, dict *dbops.Dictionary, equalSources func(string, string) bool) diag.Diagnostics {
 	var diags diag.Diagnostics
 
 	state.Comment = schemahelpers.SyncOptionalString(state.Comment, dict.Comment)
-	if state.Source.IsNull() || state.Source.IsUnknown() || !sourcesEqual(state.Source.ValueString(), dict.Source) {
+	if state.Source.IsNull() || state.Source.IsUnknown() || !equalSources(state.Source.ValueString(), dict.Source) {
 		state.Source = schemahelpers.SyncOptionalString(state.Source, dict.Source)
 	}
 	state.Layout = schemahelpers.SyncEquivalentString(state.Layout, dict.Layout)

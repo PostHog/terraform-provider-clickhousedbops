@@ -460,7 +460,9 @@ func (r *Resource) recreateOnNode(ctx context.Context, node dbops.SchemaNode, de
 	// Recreating one replica of a Replicated table as another Replicated table would leave it
 	// disagreeing with the other replicas in Keeper; that takes a replacement of every replica.
 	// A replica recreated as a local table leaves Keeper, because the drop is SYNC.
-	isReplicated := func(engine string) bool { return strings.HasPrefix(strings.ToLower(tableengine.BaseName(engine)), "replicated") }
+	isReplicated := func(engine string) bool {
+		return strings.HasPrefix(strings.ToLower(tableengine.BaseName(engine)), "replicated")
+	}
 	if existing != nil && isReplicated(existing.Engine) && isReplicated(desired.Engine) {
 		return fmt.Errorf("the existing table is %s, which cannot be recreated as a Replicated table one node at a time; replace it without ignore_drop_dependencies", tableengine.BaseName(existing.Engine))
 	}
