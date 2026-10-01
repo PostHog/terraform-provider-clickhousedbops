@@ -3,6 +3,7 @@ package tablecontents
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -112,6 +113,10 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	}
 
 	desired, err := r.client.DataChecksum(ctx, plan.Database.ValueString(), plan.Table.ValueString(), plan.Format.ValueString(), plan.Data.ValueString())
+	if err != nil && !errors.Is(err, dbops.ErrTableNotFound) {
+		resp.Diagnostics.AddError("Error reading the declared data", err.Error())
+		return
+	}
 	if err != nil {
 		// A table that this plan creates does not exist yet; apply computes the checksum.
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("checksum"), types.StringUnknown())...)
@@ -194,21 +199,21 @@ func (r *Resource) write(ctx context.Context, plan *model) diag.Diagnostics {
 		diags.AddError("Error listing cluster nodes", fmt.Sprintf("%+v\n", err))
 		return diags
 	}
-	written := map[uint64]bool{}
+	written := map[string]bool{}
 	for _, node := range nodes {
-		replicated, err := node.Client.IsReplicated(ctx, database, table)
+		replicationPath, err := node.Client.ReplicationPath(ctx, database, table)
 		if err != nil {
 			diags.AddError(fmt.Sprintf("Error reading %s.%s on node %q", database, table, node.Host), fmt.Sprintf("%+v\n", err))
 			return diags
 		}
-		if replicated && written[node.ShardNum] {
+		if replicationPath != "" && written[replicationPath] {
 			continue
 		}
 		if err := node.Client.ReplaceTableContents(ctx, database, table, plan.Format.ValueString(), plan.Data.ValueString()); err != nil {
 			diags.AddError(fmt.Sprintf("Error writing the contents of %s.%s on node %q", database, table, node.Host), fmt.Sprintf("%+v\n", err))
 			return diags
 		}
-		written[node.ShardNum] = true
+		written[replicationPath] = true
 	}
 
 	desired, err := r.client.DataChecksum(ctx, database, table, plan.Format.ValueString(), plan.Data.ValueString())
@@ -242,6 +247,7 @@ func (r *Resource) nodesChecksum(ctx context.Context, database string, table str
 		return "", false, diags
 	}
 	byChecksum := map[string][]string{}
+	var missing []string
 	for _, node := range nodes {
 		checksum, exists, err := node.Client.TableContentsChecksum(ctx, database, table)
 		if err != nil {
@@ -249,16 +255,23 @@ func (r *Resource) nodesChecksum(ctx context.Context, database string, table str
 			return "", false, diags
 		}
 		if !exists {
-			return "", false, diags
+			missing = append(missing, node.Host)
+			continue
 		}
 		byChecksum[checksum] = append(byChecksum[checksum], node.Host)
 	}
-	if len(byChecksum) == 1 {
+	if len(byChecksum) == 0 {
+		return "", false, diags
+	}
+	if len(byChecksum) == 1 && len(missing) == 0 {
 		for checksum := range byChecksum {
 			return checksum, true, diags
 		}
 	}
 	var groups []string
+	if len(missing) > 0 {
+		groups = append(groups, "table missing on "+strings.Join(missing, ", "))
+	}
 	for checksum, hosts := range byChecksum {
 		groups = append(groups, fmt.Sprintf("%s on %s", checksum, strings.Join(hosts, ", ")))
 	}

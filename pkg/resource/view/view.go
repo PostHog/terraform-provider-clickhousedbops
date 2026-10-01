@@ -85,6 +85,18 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	_, converged, diags := schemahelpers.PlanNodeStates(ctx, r.client, plan,
+		func(ctx context.Context, client dbops.Client) (*dbops.View, error) {
+			return client.GetView(ctx, plan.Database.ValueString(), plan.Name.ValueString(), plan.ClusterName.ValueStringPointer())
+		}, syncViewState)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !converged {
+		state.CreateStatement = types.StringUnknown()
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
+	}
 	if !plan.Columns.Equal(state.Columns) {
 		return
 	}

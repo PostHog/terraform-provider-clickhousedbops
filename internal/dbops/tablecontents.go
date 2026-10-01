@@ -2,6 +2,7 @@ package dbops
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
 
@@ -15,6 +16,8 @@ import (
 // The declared data is parsed by ClickHouse with the table's own column types, through the
 // format() table function, so that the two checksums agree whenever the rows are the same.
 
+var ErrTableNotFound = stderrors.New("table does not exist")
+
 type insertableColumn struct {
 	name string
 	typ  string
@@ -24,7 +27,10 @@ type insertableColumn struct {
 // false when the table does not exist.
 func (i *impl) TableContentsChecksum(ctx context.Context, database string, table string) (string, bool, error) {
 	columns, err := i.insertableColumns(ctx, database, table)
-	if err != nil || len(columns) == 0 {
+	if stderrors.Is(err, ErrTableNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
 		return "", false, err
 	}
 	checksum, err := i.checksum(ctx, qualified(database, table), columns, nil)
@@ -38,9 +44,6 @@ func (i *impl) DataChecksum(ctx context.Context, database string, table string, 
 	if err != nil {
 		return "", err
 	}
-	if len(columns) == 0 {
-		return "", errors.Errorf("table %s.%s does not exist", database, table)
-	}
 	return i.checksum(ctx, formatSource(format, columns), columns, dataParam(data))
 }
 
@@ -52,9 +55,6 @@ func (i *impl) ReplaceTableContents(ctx context.Context, database string, table 
 	columns, err := i.insertableColumns(ctx, database, table)
 	if err != nil {
 		return err
-	}
-	if len(columns) == 0 {
-		return errors.Errorf("table %s.%s does not exist", database, table)
 	}
 
 	definition, err := i.stagingDefinition(ctx, database, table)
@@ -116,7 +116,7 @@ func (i *impl) ReplaceTableContents(ctx context.Context, database string, table 
 // IsReplicated reports whether the table is a Replicated table, whose rows every replica of a
 // shard shares.
 func (i *impl) IsReplicated(ctx context.Context, database string, table string) (bool, error) {
-	path, err := i.zookeeperPath(ctx, database, table)
+	path, err := i.ReplicationPath(ctx, database, table)
 	return path != "", err
 }
 
@@ -163,6 +163,17 @@ func (i *impl) insertableColumns(ctx context.Context, database string, table str
 	})
 	if err != nil {
 		return nil, errors.WithMessage(err, "error reading the table's columns")
+	}
+	if len(columns) == 0 {
+		exists := false
+		sql := fmt.Sprintf("SELECT name FROM system.tables WHERE database = %s AND name = %s", stringLiteral(database), stringLiteral(table))
+		if err := i.clickhouseClient.Select(ctx, sql, func(clickhouseclient.Row) error { exists = true; return nil }); err != nil {
+			return nil, errors.WithMessage(err, "error checking whether the table exists")
+		}
+		if !exists {
+			return nil, fmt.Errorf("table %s.%s: %w", database, table, ErrTableNotFound)
+		}
+		return nil, errors.Errorf("table %s.%s has no insertable columns", database, table)
 	}
 	return columns, nil
 }

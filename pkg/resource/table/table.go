@@ -263,6 +263,52 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
+	states, converged, diags := schemahelpers.PlanNodeStates(ctx, r.client, plan,
+		func(ctx context.Context, client dbops.Client) (*dbops.Table, error) {
+			remote, err := client.GetTable(ctx, desiredTable.Database, desiredTable.Name, plan.ClusterName.ValueStringPointer())
+			if err != nil || remote == nil {
+				return nil, err
+			}
+			filtered := filterUnmanaged(*remote, desiredTable, columnPatterns, indexPatterns)
+			if r.client.IgnoreColumnOrder() {
+				filtered.Columns = alignColumnOrder(filtered.Columns, desiredTable.Columns)
+			}
+			return &filtered, nil
+		}, func(ctx context.Context, candidate *TableResourceModel, remote *dbops.Table) diag.Diagnostics {
+			settings, err := r.client.GetTableSettingCapabilities(ctx, remote.Engine, collectSettingNames(remote.Settings, desiredTable.Settings))
+			if err != nil {
+				return schemahelpers.DiagnosticsFromErr("Error reading table setting capabilities", err)
+			}
+			return syncTableState(ctx, candidate, remote, settings)
+		})
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !converged {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
+	}
+	for _, candidate := range states {
+		remote, err := expandTableModel(ctx, candidate)
+		if err != nil {
+			resp.Diagnostics.AddError("Invalid remote table", err.Error())
+			return
+		}
+		settings, err := r.client.GetTableSettingCapabilities(ctx, remote.Engine, collectSettingNames(remote.Settings, desiredTable.Settings))
+		if err != nil {
+			resp.Diagnostics.AddError("Error reading table setting capabilities", err.Error())
+			return
+		}
+		nodePlan, err := planTableUpdate(remote, desiredTable, capabilities, settings)
+		if err != nil {
+			resp.Diagnostics.AddError("Error planning table update", err.Error())
+			return
+		}
+		maps.Copy(updatePlan.ReplaceAttrs, nodePlan.ReplaceAttrs)
+		if !enginesEquivalent(remote.Engine, desiredTable.Engine) {
+			updatePlan.ReplaceAttrs["engine"] = struct{}{}
+		}
+	}
 	if !enginesEquivalent(currentTable.Engine, desiredTable.Engine) {
 		updatePlan.ReplaceAttrs["engine"] = struct{}{}
 	}
@@ -285,6 +331,9 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		resp.RequiresReplace = append(resp.RequiresReplace, path.Root(attr))
 	}
 	if len(resp.RequiresReplace) > 0 {
+		// OpenTofu ignores replacement paths whose values did not change in collapsed state.
+		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("create_statement"))
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
 		resp.Diagnostics.Append(r.guardDataLoss(ctx, state, "replace")...)
 		if resp.Diagnostics.HasError() {
 			return
@@ -294,7 +343,7 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	// Nothing to run on any node: the create statement stays what it is.
 	var plannedNodes types.List
 	resp.Diagnostics.Append(resp.Plan.GetAttribute(ctx, path.Root("nodes"), &plannedNodes)...)
-	if len(updatePlan.ReplaceAttrs) == 0 && len(updatePlan.ActionGroups) == 0 && plannedNodes.Equal(state.Nodes) {
+	if converged && len(updatePlan.ReplaceAttrs) == 0 && len(updatePlan.ActionGroups) == 0 && plannedNodes.Equal(state.Nodes) {
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), state.CreateStatement)...)
 	}
 }
@@ -489,7 +538,7 @@ func (r *Resource) recreateOnNode(ctx context.Context, node dbops.SchemaNode, de
 // refusal, and again before the drop.
 func (r *Resource) guardDataLoss(ctx context.Context, state TableResourceModel, action string) diag.Diagnostics {
 	var diags diag.Diagnostics
-	if state.ForceDestroy.ValueBool() || !strings.HasSuffix(strings.ToLower(tableengine.BaseName(state.Engine.ValueString())), "mergetree") {
+	if state.ForceDestroy.ValueBool() {
 		return diags
 	}
 
@@ -500,6 +549,14 @@ func (r *Resource) guardDataLoss(ctx context.Context, state TableResourceModel, 
 	}
 	var holding []string
 	for _, node := range nodes {
+		table, err := node.Client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+		if err != nil {
+			diags.AddError(fmt.Sprintf("Error reading table on node %q", node.Host), err.Error())
+			return diags
+		}
+		if table == nil || !strings.HasSuffix(strings.ToLower(tableengine.BaseName(table.Engine)), "mergetree") {
+			continue
+		}
 		rows, err := node.Client.TableRows(ctx, state.Database.ValueString(), state.Name.ValueString())
 		if err != nil {
 			diags.AddError(fmt.Sprintf("Error reading rows on node %q", node.Host), fmt.Sprintf("%+v\n", err))
@@ -564,7 +621,7 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 			_, err := client.CreateTable(ctx, table, clusterName)
 			return err
 		},
-		Reconcile: func(ctx context.Context, node dbops.SchemaNode, firstInShard bool, existing *dbops.Table) error {
+		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.Table) error {
 			remote := filterUnmanaged(*existing, desired, columnPatterns, indexPatterns)
 			if r.client.IgnoreColumnOrder() {
 				remote.Columns = alignColumnOrder(remote.Columns, desired.Columns)
@@ -585,21 +642,9 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 				return err
 			}
 
-			updatePlan := plannedTableUpdate{ReplaceAttrs: map[string]struct{}{}}
-			if replicated && !firstInShard {
-				actions, replace, err := planSettingsUpdate(current.Settings, desired.Settings, buildEngineUpdateStrategy(capabilities), settingCapabilities)
-				if err != nil {
-					return err
-				}
-				if replace {
-					updatePlan.ReplaceAttrs["settings"] = struct{}{}
-				}
-				updatePlan.ActionGroups = actions
-			} else {
-				updatePlan, err = planTableUpdate(current, desired, capabilities, settingCapabilities)
-				if err != nil {
-					return err
-				}
+			updatePlan, err := planTableUpdate(current, desired, capabilities, settingCapabilities)
+			if err != nil {
+				return err
 			}
 			if !enginesEquivalent(remote.Engine, desired.Engine) {
 				updatePlan.ReplaceAttrs["engine"] = struct{}{}

@@ -67,7 +67,7 @@ func (i *impl) waitForAlter(ctx context.Context, database string, name string, s
 // waitForReplicaMetadata waits until every replica of a Replicated table has applied the
 // table's latest metadata version from Keeper. Other tables return at once.
 func (i *impl) waitForReplicaMetadata(ctx context.Context, database string, name string) error {
-	zookeeperPath, err := i.zookeeperPath(ctx, database, name)
+	zookeeperPath, err := i.ReplicationPath(ctx, database, name)
 	if err != nil || zookeeperPath == "" {
 		return err
 	}
@@ -98,7 +98,7 @@ func (i *impl) waitForReplicaMetadata(ctx context.Context, database string, name
 	}
 }
 
-func (i *impl) zookeeperPath(ctx context.Context, database string, name string) (string, error) {
+func (i *impl) ReplicationPath(ctx context.Context, database string, name string) (string, error) {
 	sql, err := querybuilder.NewSelect(
 		[]querybuilder.Field{querybuilder.NewField("zookeeper_path")},
 		"system.replicas",

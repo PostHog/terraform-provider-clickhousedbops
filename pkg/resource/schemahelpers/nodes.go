@@ -62,6 +62,42 @@ func PlanNodes(ctx context.Context, client dbops.Client, clusterName types.Strin
 	return diags
 }
 
+// PlanNodeStates compares every node with the desired managed definition. Missing or
+// differing nodes must keep create_statement unknown so that apply converges the cluster.
+func PlanNodeStates[M any, T any](
+	ctx context.Context, client dbops.Client, desired M,
+	get func(context.Context, dbops.Client) (*T, error),
+	sync func(context.Context, *M, *T) diag.Diagnostics,
+) ([]M, bool, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	nodes, err := client.SchemaNodes(ctx)
+	if err != nil {
+		diags.AddError("Error listing cluster nodes", err.Error())
+		return nil, false, diags
+	}
+	var states []M
+	converged := true
+	for _, node := range nodes {
+		object, err := get(ctx, node.Client)
+		if err != nil {
+			diags.AddError(fmt.Sprintf("Error reading from node %q", node.Host), err.Error())
+			return nil, false, diags
+		}
+		if object == nil {
+			converged = false
+			continue
+		}
+		candidate := desired
+		diags.Append(sync(ctx, &candidate, object)...)
+		if diags.HasError() {
+			return nil, false, diags
+		}
+		converged = converged && reflect.DeepEqual(candidate, desired)
+		states = append(states, candidate)
+	}
+	return states, converged, diags
+}
+
 // ReadNodes reads the object from every node and derives the new state with sync. The state
 // comes from the first node that has the object, or from the first node whose definition
 // differs from the current state, so that drift on any node is visible. It returns a nil
@@ -159,8 +195,14 @@ func ConvergeNodes[T any](ctx context.Context, client dbops.Client, adopt bool, 
 		if existing[index] == nil {
 			continue
 		}
+		// Earlier ALTERs may have changed this replica through Keeper, across topology shards.
+		current, err := converger.Get(ctx, node.Client)
+		if err != nil || current == nil {
+			diags.AddError(fmt.Sprintf("Error rereading %s on node %q", converger.Kind, node.Host), fmt.Sprintf("Object disappeared or could not be read: %v", err))
+			return nil, noNodes, diags
+		}
 		_, seen := firstInShard[node.ShardNum]
-		if err := converger.Reconcile(ctx, node, !seen, existing[index]); err != nil {
+		if err := converger.Reconcile(ctx, node, !seen, current); err != nil {
 			diags.AddError(fmt.Sprintf("Error updating %s on node %q", converger.Kind, node.Host), err.Error())
 			return nil, noNodes, diags
 		}

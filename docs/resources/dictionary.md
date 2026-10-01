@@ -89,7 +89,7 @@ resource "clickhousedbops_dictionary" "teams" {
 
 ### Read-Only
 
-- `create_statement` (String) The CREATE DICTIONARY statement as returned by ClickHouse
+- `create_statement` (String, Sensitive) The CREATE DICTIONARY statement as returned by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.dictionary or database.dictionary
 - `nodes` (List of String) Hosts where the dictionary exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified name in the form database.dictionary

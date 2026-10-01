@@ -26,6 +26,7 @@ type Client interface {
 	DataChecksum(ctx context.Context, database string, table string, format string, data string) (string, error)
 	ReplaceTableContents(ctx context.Context, database string, table string, format string, data string) error
 	IsReplicated(ctx context.Context, database string, table string) (bool, error)
+	ReplicationPath(ctx context.Context, database string, table string) (string, error)
 	AlterTable(ctx context.Context, database string, name string, clusterName *string, actions []string) ([]RunningMutation, error)
 	GetTableEngineCapabilities(ctx context.Context, engine string) (TableEngineCapabilities, error)
 	GetTableSettingCapabilities(ctx context.Context, engine string, settingNames []string) (map[string]TableSettingCapability, error)

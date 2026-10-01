@@ -41,6 +41,20 @@ func NewResource() resource.Resource {
 	return &Resource{}
 }
 
+const (
+	attributeEngine      = "engine"
+	attributePartitionBy = "partition_by"
+	attributeOrderBy     = "order_by"
+	attributePrimaryKey  = "primary_key"
+	attributeSampleBy    = "sample_by"
+	attributeTtl         = "ttl"
+	attributeSettings    = "settings"
+	attributePopulate    = "populate"
+	attributeToTable     = "to_table"
+	attributeColumns     = "columns"
+	attributeToColumns   = "to_columns"
+)
+
 type Resource struct {
 	client dbops.Client
 }
@@ -51,8 +65,8 @@ func (r *Resource) Metadata(_ context.Context, req resource.MetadataRequest, res
 
 func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	attrs := schemahelpers.CommonSchemaAttributes("materialized view")
-	attrs["columns"] = schemahelpers.ColumnsAttribute("Optional inline materialized-view columns for engine-backed definitions.")
-	attrs["engine"] = schema.StringAttribute{
+	attrs[attributeColumns] = schemahelpers.ColumnsAttribute("Optional inline materialized-view columns for engine-backed definitions.")
+	attrs[attributeEngine] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw ClickHouse engine expression. Set this or to_table, but not both.",
 		Validators: []validator.String{
@@ -62,7 +76,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["partition_by"] = schema.StringAttribute{
+	attrs[attributePartitionBy] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw PARTITION BY clause expression for engine-backed materialized views",
 		Validators: []validator.String{
@@ -72,7 +86,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["order_by"] = schema.StringAttribute{
+	attrs[attributeOrderBy] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw ORDER BY clause expression for engine-backed materialized views",
 		Validators: []validator.String{
@@ -82,7 +96,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["primary_key"] = schema.StringAttribute{
+	attrs[attributePrimaryKey] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw PRIMARY KEY clause expression for engine-backed materialized views",
 		Validators: []validator.String{
@@ -92,7 +106,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["sample_by"] = schema.StringAttribute{
+	attrs[attributeSampleBy] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw SAMPLE BY clause expression for engine-backed materialized views",
 		Validators: []validator.String{
@@ -102,7 +116,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["ttl"] = schema.StringAttribute{
+	attrs[attributeTtl] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw TTL clause expression for engine-backed materialized views",
 		Validators: []validator.String{
@@ -112,7 +126,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["settings"] = schema.StringAttribute{
+	attrs[attributeSettings] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Raw SETTINGS clause body for engine-backed materialized views",
 		Validators: []validator.String{
@@ -122,14 +136,14 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["populate"] = schema.BoolAttribute{
+	attrs[attributePopulate] = schema.BoolAttribute{
 		Optional:    true,
 		Description: "Whether to append POPULATE to the CREATE MATERIALIZED VIEW statement",
 		PlanModifiers: []planmodifier.Bool{
 			boolplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["to_table"] = schema.StringAttribute{
+	attrs[attributeToTable] = schema.StringAttribute{
 		Optional:    true,
 		Description: "Destination table for TO-based materialized views. Usually this references clickhousedbops_table.<name>.qualified_name.",
 		Validators: []validator.String{
@@ -139,7 +153,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
-	attrs["to_columns"] = schemahelpers.ColumnSignaturesAttribute("Optional destination signature appended after TO <table> (...). Only name, type, and nullable are supported there. When omitted, the column list that ClickHouse infers is not tracked.")
+	attrs[attributeToColumns] = schemahelpers.ColumnSignaturesAttribute("Optional destination signature appended after TO <table> (...). Only name, type, and nullable are supported there. When omitted, the column list that ClickHouse infers is not tracked.")
 	attrs["query"] = schema.StringAttribute{
 		Required:    true,
 		Description: "Raw SELECT query used by the materialized view definition. With to_table a change is applied in place with ALTER TABLE ... MODIFY QUERY. With engine a change replaces the materialized view.",
@@ -163,7 +177,7 @@ func (r *Resource) Configure(_ context.Context, req resource.ConfigureRequest, _
 
 func (r *Resource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
 	return []resource.ConfigValidator{
-		resourcevalidator.ExactlyOneOf(path.MatchRoot("engine"), path.MatchRoot("to_table")),
+		resourcevalidator.ExactlyOneOf(path.MatchRoot(attributeEngine), path.MatchRoot(attributeToTable)),
 	}
 }
 
@@ -182,28 +196,28 @@ func (r *Resource) ValidateConfig(ctx context.Context, req resource.ValidateConf
 		!config.ToTable.IsNull() && !config.ToTable.IsUnknown() &&
 		config.Populate.ValueBool() {
 		resp.Diagnostics.AddAttributeError(
-			path.Root("populate"),
+			path.Root(attributePopulate),
 			"Invalid Attribute Combination",
 			"'populate' can only be set for engine-backed materialized views and cannot be combined with 'to_table'.",
 		)
 	}
 	if !config.ToTable.IsNull() && !config.ToTable.IsUnknown() && !config.Columns.IsNull() && !config.Columns.IsUnknown() {
 		resp.Diagnostics.AddAttributeError(
-			path.Root("columns"),
+			path.Root(attributeColumns),
 			"Invalid Attribute Combination",
 			"'columns' can only be set for engine-backed materialized views. Use 'to_columns' with 'to_table' instead.",
 		)
 	}
 	if !config.Engine.IsNull() && !config.Engine.IsUnknown() && !config.ToColumns.IsNull() && !config.ToColumns.IsUnknown() {
 		resp.Diagnostics.AddAttributeError(
-			path.Root("to_columns"),
+			path.Root(attributeToColumns),
 			"Invalid Attribute Combination",
 			"'to_columns' can only be set with 'to_table' and cannot be combined with 'engine'.",
 		)
 	}
 	if !config.Engine.IsNull() && !config.Engine.IsUnknown() && (config.OrderBy.IsNull() || config.OrderBy.IsUnknown() || config.OrderBy.ValueString() == "") {
 		resp.Diagnostics.AddAttributeError(
-			path.Root("order_by"),
+			path.Root(attributeOrderBy),
 			"Missing Required Attribute for Engine-Backed Materialized View",
 			"'order_by' must be set when 'engine' is used.",
 		)
@@ -213,12 +227,12 @@ func (r *Resource) ValidateConfig(ctx context.Context, req resource.ValidateConf
 			path  path.Path
 			value types.String
 		}{
-			{path.Root("partition_by"), config.PartitionBy},
-			{path.Root("order_by"), config.OrderBy},
-			{path.Root("primary_key"), config.PrimaryKey},
-			{path.Root("sample_by"), config.SampleBy},
-			{path.Root("ttl"), config.TTL},
-			{path.Root("settings"), config.Settings},
+			{path.Root(attributePartitionBy), config.PartitionBy},
+			{path.Root(attributeOrderBy), config.OrderBy},
+			{path.Root(attributePrimaryKey), config.PrimaryKey},
+			{path.Root(attributeSampleBy), config.SampleBy},
+			{path.Root(attributeTtl), config.TTL},
+			{path.Root(attributeSettings), config.Settings},
 		} {
 			if !attr.value.IsNull() && !attr.value.IsUnknown() {
 				resp.Diagnostics.AddAttributeError(
@@ -251,22 +265,42 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	// the provider runs it per node, not ON CLUSTER.
 	var state MaterializedViewResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	states, converged, diags := schemahelpers.PlanNodeStates(ctx, r.client, plan,
+		func(ctx context.Context, client dbops.Client) (*dbops.MaterializedView, error) {
+			return client.GetMaterializedView(ctx, plan.Database.ValueString(), plan.Name.ValueString(), plan.ClusterName.ValueStringPointer())
+		}, syncMaterializedViewState)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !converged {
+		state.CreateStatement = types.StringUnknown()
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
+	}
+	for _, remote := range states {
+		resp.RequiresReplace = append(resp.RequiresReplace, nodeReplacementPaths(plan, remote)...)
+	}
 	if (plan.ToTable.IsNull() || !plan.ClusterName.IsNull()) && !schemahelpers.SQLEqual(plan.Query.ValueString(), state.Query.ValueString()) {
 		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("query"))
+	}
+	if len(resp.RequiresReplace) > 0 {
+		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("create_statement"))
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
+		state.CreateStatement = types.StringUnknown()
 	}
 	if resp.Diagnostics.HasError() || !plan.Columns.Equal(state.Columns) || !plan.ToColumns.Equal(state.ToColumns) || !plan.Populate.Equal(state.Populate) {
 		return
 	}
 	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.Nodes, state.CreateStatement, []schemahelpers.EquivalentString{
 		{Attribute: "query", Planned: plan.Query, State: state.Query},
-		{Attribute: "to_table", Planned: plan.ToTable, State: state.ToTable},
-		{Attribute: "engine", Planned: plan.Engine, State: state.Engine},
-		{Attribute: "partition_by", Planned: plan.PartitionBy, State: state.PartitionBy},
-		{Attribute: "order_by", Planned: plan.OrderBy, State: state.OrderBy},
-		{Attribute: "primary_key", Planned: plan.PrimaryKey, State: state.PrimaryKey},
-		{Attribute: "sample_by", Planned: plan.SampleBy, State: state.SampleBy},
-		{Attribute: "ttl", Planned: plan.TTL, State: state.TTL},
-		{Attribute: "settings", Planned: plan.Settings, State: state.Settings},
+		{Attribute: attributeToTable, Planned: plan.ToTable, State: state.ToTable},
+		{Attribute: attributeEngine, Planned: plan.Engine, State: state.Engine},
+		{Attribute: attributePartitionBy, Planned: plan.PartitionBy, State: state.PartitionBy},
+		{Attribute: attributeOrderBy, Planned: plan.OrderBy, State: state.OrderBy},
+		{Attribute: attributePrimaryKey, Planned: plan.PrimaryKey, State: state.PrimaryKey},
+		{Attribute: attributeSampleBy, Planned: plan.SampleBy, State: state.SampleBy},
+		{Attribute: attributeTtl, Planned: plan.TTL, State: state.TTL},
+		{Attribute: attributeSettings, Planned: plan.Settings, State: state.Settings},
 	})...)
 }
 
@@ -372,16 +406,16 @@ func (r *Resource) convergeMaterializedView(ctx context.Context, plan Materializ
 			queryChanged := !candidate.Query.Equal(plan.Query)
 			replaceAttrs := make([]string, 0)
 			for name, values := range map[string][2]attr.Value{
-				"columns":      {candidate.Columns, plan.Columns},
-				"engine":       {candidate.Engine, plan.Engine},
-				"partition_by": {candidate.PartitionBy, plan.PartitionBy},
-				"order_by":     {candidate.OrderBy, plan.OrderBy},
-				"primary_key":  {candidate.PrimaryKey, plan.PrimaryKey},
-				"sample_by":    {candidate.SampleBy, plan.SampleBy},
-				"ttl":          {candidate.TTL, plan.TTL},
-				"settings":     {candidate.Settings, plan.Settings},
-				"to_table":     {candidate.ToTable, plan.ToTable},
-				"to_columns":   {candidate.ToColumns, plan.ToColumns},
+				attributeColumns:     {candidate.Columns, plan.Columns},
+				attributeEngine:      {candidate.Engine, plan.Engine},
+				attributePartitionBy: {candidate.PartitionBy, plan.PartitionBy},
+				attributeOrderBy:     {candidate.OrderBy, plan.OrderBy},
+				attributePrimaryKey:  {candidate.PrimaryKey, plan.PrimaryKey},
+				attributeSampleBy:    {candidate.SampleBy, plan.SampleBy},
+				attributeTtl:         {candidate.TTL, plan.TTL},
+				attributeSettings:    {candidate.Settings, plan.Settings},
+				attributeToTable:     {candidate.ToTable, plan.ToTable},
+				attributeToColumns:   {candidate.ToColumns, plan.ToColumns},
 			} {
 				if !values[0].Equal(values[1]) {
 					replaceAttrs = append(replaceAttrs, name)

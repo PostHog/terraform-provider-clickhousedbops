@@ -59,6 +59,9 @@ func (r *Resource) Metadata(_ context.Context, req resource.MetadataRequest, res
 
 func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	attrs := schemahelpers.CommonSchemaAttributes("dictionary")
+	statement := attrs["create_statement"].(schema.StringAttribute)
+	statement.Sensitive = true
+	attrs["create_statement"] = statement
 	attrs["attributes"] = schema.ListNestedAttribute{
 		Required:    true,
 		Description: "Dictionary attributes, including key columns referenced by primary_key. This can be assigned directly from a local list of objects.",
@@ -200,6 +203,20 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+	_, converged, diags := schemahelpers.PlanNodeStates(ctx, r.client, plan,
+		func(ctx context.Context, client dbops.Client) (*dbops.Dictionary, error) {
+			return client.GetDictionary(ctx, plan.Database.ValueString(), plan.Name.ValueString(), plan.ClusterName.ValueStringPointer())
+		}, func(ctx context.Context, state *DictionaryResourceModel, dict *dbops.Dictionary) diag.Diagnostics {
+			return syncDictionaryState(ctx, state, dict, r.sourceComparison())
+		})
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !converged {
+		state.CreateStatement = types.StringUnknown()
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
 	}
 	planned, err := expandDictionaryModel(ctx, plan)
 	if err != nil {

@@ -39,7 +39,7 @@ func (dcm *DockerComposeManager) runCommandWithEnv(env map[string]string, args .
 		environment = append(environment, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	cmd.Env = environment
+	cmd.Env = append(os.Environ(), environment...)
 
 	return cmd.Run()
 }
