@@ -12,8 +12,8 @@ provider binaries, SHA256 checksums, and Terraform protocol manifest using the b
 upstream runners or signing secrets. Releases go to this fork's GitHub releases; they are
 unsigned and do not publish to the upstream Terraform Registry provider.
 
-Inherited workflows are preserved in `.github/disabled-workflows/`, outside GitHub's active
-workflow directory.
+Inherited workflows and their unused local actions are removed; their previous definitions
+remain available in Git history.
 
 With this Terraform provider you can:
 
