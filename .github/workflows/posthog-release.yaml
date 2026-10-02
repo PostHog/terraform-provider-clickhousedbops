@@ -1,0 +1,52 @@
+name: PostHog Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: posthog-release
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    if: github.repository == 'PostHog/terraform-provider-clickhousedbops'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Choose next patch version
+        id: version
+        uses: mathieudutour/github-tag-action@af99e60ce8132224b8e6ebab5023449fe256ed46 # v7
+        with:
+          github_token: ${{ github.token }}
+          force_bump: patch
+          create_local_tag: true
+
+      - name: Build and publish release
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.18.2
+          args: release --clean --skip=sign
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GORELEASER_PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}

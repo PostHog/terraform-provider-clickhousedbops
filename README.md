@@ -1,10 +1,19 @@
 # Clickhouse DB ops Terraform Provider
 
-[![Docs](https://github.com/ClickHouse/terraform-provider-clickhousedbops/actions/workflows/docs.yaml/badge.svg)](https://github.com/ClickHouse/terraform-provider-clickhousedbops/actions/workflows/docs.yaml)
-[![Dependabot Updates](https://github.com/ClickHouse/terraform-provider-clickhousedbops/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/ClickHouse/terraform-provider-clickhousedbops/actions/workflows/dependabot/dependabot-updates)
-[![Unit tests](https://github.com/ClickHouse/terraform-provider-clickhousedbops/actions/workflows/test.yaml/badge.svg)](https://github.com/ClickHouse/terraform-provider-clickhousedbops/actions/workflows/test.yaml)
+[![PostHog Release](https://github.com/PostHog/terraform-provider-clickhousedbops/actions/workflows/posthog-release.yaml/badge.svg)](https://github.com/PostHog/terraform-provider-clickhousedbops/actions/workflows/posthog-release.yaml)
 
-This is the official Terraform provider for ClickHouse database operations.
+This is PostHog's fork of the Terraform provider for ClickHouse database operations.
+
+Every push to `main`, including merged pull requests, publishes the next patch version to
+[PostHog's GitHub releases](https://github.com/PostHog/terraform-provider-clickhousedbops/releases)
+after the Go tests and builds pass. The existing `.goreleaser.yml` builds and publishes the
+provider binaries, SHA256 checksums, and Terraform protocol manifest using the built-in
+`GITHUB_TOKEN`. The workflow uses GitHub-hosted runners and skips GPG signing, so it needs no
+upstream runners or signing secrets. Releases go to this fork's GitHub releases; they are
+unsigned and do not publish to the upstream Terraform Registry provider.
+
+Inherited workflows and their unused local actions are removed; their previous definitions
+remain available in Git history.
 
 With this Terraform provider you can:
 
