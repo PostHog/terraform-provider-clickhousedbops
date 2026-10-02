@@ -62,3 +62,5 @@ resource "clickhousedbops_table_contents" "country" {
 
 - `checksum` (String) Row count and an order-independent hash of the rows. In state it is what the table holds; in the plan it is what data holds.
 - `id` (String) database.table
+- `sql_plan` (String) Reviewed writes, in execution order per target. Parameter values and dictionary sources are redacted.
+- `sql_plan_digest` (String) Digest of the reviewed SQL operations.

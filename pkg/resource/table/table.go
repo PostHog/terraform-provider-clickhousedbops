@@ -21,6 +21,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/clickhouseclient"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/tableengine"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/schemahelpers"
@@ -669,6 +670,14 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 					)
 				}
 			}
+			if clickhouseclient.IsRecordingSQL(ctx) {
+				preview, err := previewUpdatedTable(*existing, current, desired)
+				if err != nil {
+					return err
+				}
+				clickhouseclient.SetPreviewObject(ctx, node.Host, "table", desired.Database, desired.Name, &preview)
+			}
+
 			return nil
 		},
 	})

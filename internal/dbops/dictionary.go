@@ -44,7 +44,7 @@ func (i *impl) ReplaceDictionary(ctx context.Context, dictionary Dictionary, clu
 }
 
 func (i *impl) createDictionary(ctx context.Context, dictionary Dictionary, clusterName *string, orReplace bool) (*Dictionary, error) {
-	sql, err := querybuilder.CreateDictionaryQuery{
+	builder := querybuilder.CreateDictionaryQuery{
 		Database:    dictionary.Database,
 		Name:        dictionary.Name,
 		ClusterName: clusterName,
@@ -57,19 +57,35 @@ func (i *impl) createDictionary(ctx context.Context, dictionary Dictionary, clus
 		Range:       dictionary.Range,
 		Settings:    dictionary.Settings,
 		Comment:     dictionary.Comment,
-	}.Build()
+	}
+	sql, err := builder.Build()
 	if err != nil {
 		return nil, errors.WithMessage(err, "error building query")
 	}
 
-	if err := i.clickhouseClient.Exec(ctx, sql); err != nil {
+	maskedBuilder := builder
+	maskedBuilder.Source = "[REDACTED]"
+	masked, err := maskedBuilder.Build()
+	if err != nil {
+		return nil, err
+	}
+	if err := i.clickhouseClient.Exec(clickhouseclient.WithMaskedQuery(ctx, masked), sql); err != nil {
 		return nil, errors.WithMessage(err, "error running query")
+	}
+
+	if clickhouseclient.IsRecordingSQL(ctx) {
+		dictionary.CreateStatement = sql
+		clickhouseclient.SetPreviewObject(ctx, i.host, "dictionary", dictionary.Database, dictionary.Name, &dictionary)
+		return &dictionary, nil
 	}
 
 	return i.GetDictionary(ctx, dictionary.Database, dictionary.Name, clusterName)
 }
 
 func (i *impl) GetDictionary(ctx context.Context, database string, name string, clusterName *string) (*Dictionary, error) {
+	if object, found := clickhouseclient.PreviewObject[Dictionary](ctx, i.host, "dictionary", database, name); found {
+		return object, nil
+	}
 	sql, err := querybuilder.NewSelect(
 		[]querybuilder.Field{
 			querybuilder.NewField("database"),
@@ -167,7 +183,11 @@ func (i *impl) DeleteDictionary(ctx context.Context, database string, name strin
 	if err != nil {
 		return err
 	}
-	return i.deleteIfExists(ctx, dictionary != nil, querybuilder.NewDropDictionary(database, name).WithCluster(clusterName))
+	err = i.deleteIfExists(ctx, dictionary != nil, querybuilder.NewDropDictionary(database, name).WithCluster(clusterName))
+	if err == nil {
+		clickhouseclient.SetPreviewObject(ctx, i.host, "dictionary", database, name, (*Dictionary)(nil))
+	}
+	return err
 }
 
 func toQueryBuilderDictionaryAttributes(attributes []DictionaryAttribute) []querybuilder.DictionaryAttributeDefinition {

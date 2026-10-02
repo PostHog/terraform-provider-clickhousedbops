@@ -118,10 +118,19 @@ func (i *impl) CreateTable(ctx context.Context, table Table, clusterName *string
 		return nil, errors.WithMessage(err, "error running query")
 	}
 
+	if clickhouseclient.IsRecordingSQL(ctx) {
+		table.CreateStatement = sql
+		clickhouseclient.SetPreviewObject(ctx, i.host, "table", table.Database, table.Name, &table)
+		return &table, nil
+	}
+
 	return i.GetTable(ctx, table.Database, table.Name, clusterName)
 }
 
 func (i *impl) GetTable(ctx context.Context, database string, name string, clusterName *string) (*Table, error) {
+	if object, found := clickhouseclient.PreviewObject[Table](ctx, i.host, "table", database, name); found {
+		return object, nil
+	}
 	object, err := i.getSchemaObject(ctx, database, name, clusterName, schemaObjectKindTable)
 	if err != nil {
 		return nil, err
@@ -190,7 +199,11 @@ func (i *impl) DeleteTable(ctx context.Context, database string, name string, cl
 	if err != nil {
 		return err
 	}
-	return i.deleteIfExists(ctx, table != nil, querybuilder.NewDropTable(database, name).WithCluster(clusterName).SkipDependencyCheck(skipDependencyCheck))
+	err = i.deleteIfExists(ctx, table != nil, querybuilder.NewDropTable(database, name).WithCluster(clusterName).SkipDependencyCheck(skipDependencyCheck))
+	if err == nil {
+		clickhouseclient.SetPreviewObject(ctx, i.host, "table", database, name, (*Table)(nil))
+	}
+	return err
 }
 
 // TableRows returns the rows the table holds on this node; 0 when it does not exist.
@@ -220,6 +233,10 @@ func (i *impl) AlterTable(ctx context.Context, database string, name string, clu
 	sql, err := querybuilder.BuildAlterTable(database, name, clusterName, actions)
 	if err != nil {
 		return nil, errors.WithMessage(err, "error building query")
+	}
+
+	if clickhouseclient.IsRecordingSQL(ctx) {
+		return nil, i.clickhouseClient.Exec(ctx, sql)
 	}
 
 	startedAt, err := i.serverNow(ctx)
@@ -258,10 +275,19 @@ func (i *impl) createView(ctx context.Context, view View, clusterName *string, o
 		return nil, errors.WithMessage(err, "error running query")
 	}
 
+	if clickhouseclient.IsRecordingSQL(ctx) {
+		view.CreateStatement = sql
+		clickhouseclient.SetPreviewObject(ctx, i.host, "view", view.Database, view.Name, &view)
+		return &view, nil
+	}
+
 	return i.GetView(ctx, view.Database, view.Name, clusterName)
 }
 
 func (i *impl) GetView(ctx context.Context, database string, name string, clusterName *string) (*View, error) {
+	if object, found := clickhouseclient.PreviewObject[View](ctx, i.host, "view", database, name); found {
+		return object, nil
+	}
 	object, err := i.getSchemaObject(ctx, database, name, clusterName, schemaObjectKindView)
 	if err != nil {
 		return nil, err
@@ -289,7 +315,11 @@ func (i *impl) DeleteView(ctx context.Context, database string, name string, clu
 	if err != nil {
 		return err
 	}
-	return i.deleteIfExists(ctx, view != nil, querybuilder.NewDropView(database, name).WithCluster(clusterName))
+	err = i.deleteIfExists(ctx, view != nil, querybuilder.NewDropView(database, name).WithCluster(clusterName))
+	if err == nil {
+		clickhouseclient.SetPreviewObject(ctx, i.host, "view", database, name, (*View)(nil))
+	}
+	return err
 }
 
 func (i *impl) CreateMaterializedView(ctx context.Context, view MaterializedView, clusterName *string) (*MaterializedView, error) {
@@ -318,10 +348,19 @@ func (i *impl) CreateMaterializedView(ctx context.Context, view MaterializedView
 		return nil, errors.WithMessage(err, "error running query")
 	}
 
+	if clickhouseclient.IsRecordingSQL(ctx) {
+		view.CreateStatement = sql
+		clickhouseclient.SetPreviewObject(ctx, i.host, "materializedview", view.Database, view.Name, &view)
+		return &view, nil
+	}
+
 	return i.GetMaterializedView(ctx, view.Database, view.Name, clusterName)
 }
 
 func (i *impl) GetMaterializedView(ctx context.Context, database string, name string, clusterName *string) (*MaterializedView, error) {
+	if object, found := clickhouseclient.PreviewObject[MaterializedView](ctx, i.host, "materializedview", database, name); found {
+		return object, nil
+	}
 	object, err := i.getSchemaObject(ctx, database, name, clusterName, schemaObjectKindMaterializedView)
 	if err != nil {
 		return nil, err
@@ -374,7 +413,11 @@ func (i *impl) DeleteMaterializedView(ctx context.Context, database string, name
 	if err != nil {
 		return err
 	}
-	return i.deleteIfExists(ctx, view != nil, querybuilder.NewDropMaterializedView(database, name).WithCluster(clusterName))
+	err = i.deleteIfExists(ctx, view != nil, querybuilder.NewDropMaterializedView(database, name).WithCluster(clusterName))
+	if err == nil {
+		clickhouseclient.SetPreviewObject(ctx, i.host, "materializedview", database, name, (*MaterializedView)(nil))
+	}
+	return err
 }
 
 // withSecretsShown makes a query that reads object definitions show their secrets, when the

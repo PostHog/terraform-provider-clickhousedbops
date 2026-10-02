@@ -27,6 +27,31 @@ You can find examples in the [examples/tests](https://github.com/ClickHouse/terr
 
 Please refer to the [official docs](https://registry.terraform.io/providers/ClickHouse/clickhousedbops/latest/docs) for more details.
 
+## Reviewing and enforcing SQL from a saved plan
+
+Set `enforce_sql_plan = true` on the provider configuration that manages your schema:
+
+```hcl
+provider "clickhousedbops" {
+  # Existing connection, authentication and optional fanout_cluster settings.
+  enforce_sql_plan = true
+}
+```
+
+1. Run `tofu plan -no-color -out=tfplan | tee reviewed-sql.txt` (or the equivalent Terraform command).
+2. Review each **Reviewed SQL execution plan** diagnostic: it lists the SQL and connection target for every proposed write, including drops, replacements and staging-table cleanup.
+3. Apply that exact artifact with `tofu apply tfplan`.
+
+Planning uses the existing resource write paths and SQL builders, with writes recorded rather than sent to ClickHouse. The saved plan carries the full statements, connection targets and bound parameter values. A computed digest binds create/update statements to the planned state, so apply-time replanning cannot silently substitute different SQL. Destroy and replacement drops use the saved private manifest because their planned state is null.
+
+Before sending a write, the client checks its SQL, target, bound values, count and order against that manifest. Missing manifests and unreviewed writes fail closed. Already satisfied writes may be skipped, including writes satisfied by replication. The guarantee is that the provider executes **only reviewed writes**, not that every listed write runs or that the operation is atomic: earlier reviewed writes can remain applied after a later failure. Read-only queries and ClickHouse's internal replication, mutations and `ON CLUSTER` execution are outside the client write manifest.
+
+The plan diagnostics contain all write phases. The computed `sql_plan` attribute exposes the create/update manifest as JSON; replacement drops appear in diagnostics and saved private data. On a no-op, this attribute retains the last applied manifest. Filter plan JSON to changed resources before interpreting it as pending work.
+
+This mode supports `table`, `view`, `materialized_view`, `dictionary` and `table_contents`, including direct node fanout. Changes to other resource types fail planning; put them on a separate provider configuration. All provider and resource configuration values must be known during planning. For `table_contents`, apply schema changes first: the target table and columns used by the partition key must already exist when planning the data. Nondeterministic inputs or changes to schema/topology can require a fresh plan.
+
+Dictionary sources and bound parameter values are redacted in the printout. Their full values are still checked at apply and stored in the saved plan; protect the plan artifact like Terraform state. Use the same provider version for planning and applying.
+
 ## Migrating from terraform-provider-clickhouse
 
 Please read the [Migration guide](https://github.com/ClickHouse/terraform-provider-clickhousedbops/blob/main/migrating/README.md)
