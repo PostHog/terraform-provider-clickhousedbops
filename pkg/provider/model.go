@@ -6,6 +6,7 @@ import (
 
 // Model describes the provider data model.
 type Model struct {
+	EnforceSQLPlan        types.Bool   `tfsdk:"enforce_sql_plan"`
 	Protocol              types.String `tfsdk:"protocol"`
 	Host                  types.String `tfsdk:"host"`
 	Port                  types.Int32  `tfsdk:"port"`

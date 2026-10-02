@@ -59,7 +59,9 @@ var (
 var _ provider.Provider = &Provider{}
 
 // Provider defines the provider implementation.
-type Provider struct{}
+type Provider struct {
+	enforceSQLPlan bool
+}
 
 func (p *Provider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
 	resp.TypeName = "clickhousedbops"
@@ -69,6 +71,7 @@ func (p *Provider) Metadata(ctx context.Context, req provider.MetadataRequest, r
 func (p *Provider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Attributes: map[string]schema.Attribute{
+			"enforce_sql_plan": schema.BoolAttribute{Optional: true, Description: "Print and bind schema writes to the saved plan. Apply rejects unreviewed SQL, parameters, targets and ordering. Supports table, view, materialized_view, dictionary and table_contents; other changed resources fail planning. Configuration must be known at plan time."},
 			"protocol": schema.StringAttribute{
 				Required:    true,
 				Description: fmt.Sprintf("The protocol to use to connect to clickhouse instance. Valid options are: %s", strings.Join(availableProtocols, ", ")),
@@ -207,6 +210,15 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 	var data Model
 	var err error
 
+	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	p.enforceSQLPlan = data.EnforceSQLPlan.ValueBool()
+	if p.enforceSQLPlan && !req.Config.Raw.IsFullyKnown() {
+		resp.Diagnostics.AddError("Cannot review SQL", "enforce_sql_plan requires all provider configuration values to be known at plan time.")
+		return
+	}
 	if !req.Config.Raw.IsFullyKnown() {
 		if req.ClientCapabilities.DeferralAllowed {
 			resp.Deferred = &provider.Deferred{Reason: provider.DeferredReasonProviderConfigUnknown}
@@ -223,12 +235,6 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 
 		resp.ResourceData = dbopsClient
 		resp.DataSourceData = dbopsClient
-		return
-	}
-
-	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
-
-	if resp.Diagnostics.HasError() {
 		return
 	}
 
@@ -345,6 +351,17 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 				DialTimeout:  dialTimeout,
 				QueryTimeout: queryTimeout,
 			})
+		}
+	}
+
+	if p.enforceSQLPlan {
+		baseFactory := newClickhouseClient
+		newClickhouseClient = func(host string, port uint16) (clickhouseclient.ClickhouseClient, error) {
+			client, err := baseFactory(host, port)
+			if err != nil {
+				return nil, err
+			}
+			return clickhouseclient.WithSQLPlan(client, fmt.Sprintf("%s://%s:%d", data.Protocol.ValueString(), host, port)), nil
 		}
 	}
 

@@ -9,6 +9,7 @@ import (
 	"github.com/pingcap/errors"
 
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/clickhouseclient"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/querybuilder"
 )
 
 // Table contents are compared by a checksum that ClickHouse computes over the rows: the row count
@@ -57,7 +58,7 @@ func (i *impl) ReplaceTableContents(ctx context.Context, database string, table 
 		return err
 	}
 
-	definition, err := i.stagingDefinition(ctx, database, table)
+	definition, partitionKey, err := i.stagingDefinition(ctx, database, table)
 	if err != nil {
 		return err
 	}
@@ -81,7 +82,12 @@ func (i *impl) ReplaceTableContents(ctx context.Context, database string, table 
 		return errors.WithMessage(err, "error loading the data into the staging table")
 	}
 
-	newPartitions, err := i.partitionIDs(ctx, database, staging)
+	var newPartitions []string
+	if clickhouseclient.IsRecordingSQL(ctx) {
+		newPartitions, err = i.dataPartitionIDs(ctx, partitionKey, format, data, columns)
+	} else {
+		newPartitions, err = i.partitionIDs(ctx, database, staging)
+	}
 	if err != nil {
 		return err
 	}
@@ -181,7 +187,7 @@ func (i *impl) insertableColumns(ctx context.Context, database string, table str
 // stagingDefinition is the engine clause of a non-replicated MergeTree table that REPLACE
 // PARTITION accepts as a source for the table: the same partition key, sorting key, primary
 // key and storage policy.
-func (i *impl) stagingDefinition(ctx context.Context, database string, table string) (string, error) {
+func (i *impl) stagingDefinition(ctx context.Context, database string, table string) (string, string, error) {
 	sql := fmt.Sprintf(
 		"SELECT engine, partition_key, sorting_key, primary_key, storage_policy FROM system.tables WHERE database = %s AND name = %s",
 		stringLiteral(database), stringLiteral(table))
@@ -196,11 +202,11 @@ func (i *impl) stagingDefinition(ctx context.Context, database string, table str
 		return nil
 	})
 	if err != nil {
-		return "", errors.WithMessage(err, "error reading the table's keys")
+		return "", "", errors.WithMessage(err, "error reading the table's keys")
 	}
 	// Other MergeTree variants merge rows by rules the staging table would have to repeat.
 	if engine != "MergeTree" && engine != "ReplicatedMergeTree" {
-		return "", errors.Errorf("table %s.%s has engine %s; declared contents need MergeTree or ReplicatedMergeTree", database, table, engine)
+		return "", "", errors.Errorf("table %s.%s has engine %s; declared contents need MergeTree or ReplicatedMergeTree", database, table, engine)
 	}
 
 	definition := "MergeTree"
@@ -218,7 +224,34 @@ func (i *impl) stagingDefinition(ctx context.Context, database string, table str
 	if storagePolicy != "" {
 		definition += " SETTINGS storage_policy = " + stringLiteral(storagePolicy)
 	}
-	return definition, nil
+	return definition, partitionKey, nil
+}
+
+// Planning reads the input through format(), without creating or populating staging tables.
+func (i *impl) dataPartitionIDs(ctx context.Context, partitionKey, format, data string, columns []insertableColumn) ([]string, error) {
+	expression := "'all'"
+	if partitionKey != "" && partitionKey != "tuple()" {
+		// MergeTree flattens a top-level tuple into separate partition-key columns.
+		open, close, found, err := querybuilder.FindTrailingTopLevelParentheses(partitionKey)
+		if err != nil {
+			return nil, err
+		}
+		if found && open == 0 && close == len(partitionKey)-1 {
+			partitionKey = partitionKey[1:close]
+		}
+		expression = "partitionId(" + partitionKey + ")"
+	}
+	sql := fmt.Sprintf("SELECT DISTINCT %s AS partition_id FROM %s ORDER BY partition_id", expression, formatSource(format, columns))
+	var ids []string
+	err := i.clickhouseClient.Select(ctx, sql, func(row clickhouseclient.Row) error {
+		id, err := row.GetString("partition_id")
+		ids = append(ids, id)
+		return err
+	}, dataParam(data))
+	if err != nil {
+		return nil, errors.WithMessage(err, "cannot review input partition IDs; the target table and its partition-key columns must exist at plan time")
+	}
+	return ids, nil
 }
 
 func (i *impl) partitionIDs(ctx context.Context, database string, table string) ([]string, error) {

@@ -3,6 +3,7 @@ package view
 import "github.com/hashicorp/terraform-plugin-framework/types"
 
 type ViewResourceModel struct {
+	SQLPlanDigest   types.String `tfsdk:"sql_plan_digest"`
 	ClusterName     types.String `tfsdk:"cluster_name"`
 	ID              types.String `tfsdk:"id"`
 	QualifiedName   types.String `tfsdk:"qualified_name"`

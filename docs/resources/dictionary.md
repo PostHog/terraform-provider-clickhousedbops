@@ -93,6 +93,7 @@ resource "clickhousedbops_dictionary" "teams" {
 - `id` (String) Stable identifier in the form cluster:database.dictionary or database.dictionary
 - `nodes` (List of String) Hosts where the dictionary exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified name in the form database.dictionary
+- `sql_plan_digest` (String) Digest of the reviewed SQL operations. When enforce_sql_plan is enabled, an apply cannot expand a known SQL plan.
 
 <a id="nestedatt--attributes"></a>
 ### Nested Schema for `attributes`

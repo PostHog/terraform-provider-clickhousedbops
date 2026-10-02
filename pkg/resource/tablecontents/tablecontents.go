@@ -18,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/clickhouseclient"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
 )
 
@@ -39,12 +40,13 @@ type Resource struct {
 }
 
 type model struct {
-	ID       types.String `tfsdk:"id"`
-	Database types.String `tfsdk:"database"`
-	Table    types.String `tfsdk:"table"`
-	Format   types.String `tfsdk:"format"`
-	Data     types.String `tfsdk:"data"`
-	Checksum types.String `tfsdk:"checksum"`
+	SQLPlanDigest types.String `tfsdk:"sql_plan_digest"`
+	ID            types.String `tfsdk:"id"`
+	Database      types.String `tfsdk:"database"`
+	Table         types.String `tfsdk:"table"`
+	Format        types.String `tfsdk:"format"`
+	Data          types.String `tfsdk:"data"`
+	Checksum      types.String `tfsdk:"checksum"`
 }
 
 // A checksum that no data can have, for a table whose nodes disagree.
@@ -59,6 +61,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 	resp.Schema = schema.Schema{
 		MarkdownDescription: description,
 		Attributes: map[string]schema.Attribute{
+			"sql_plan_digest": schema.StringAttribute{Computed: true, Description: "Digest of the reviewed SQL operations."},
 			"id": schema.StringAttribute{
 				Computed:      true,
 				Description:   "database.table",
@@ -214,6 +217,11 @@ func (r *Resource) write(ctx context.Context, plan *model) diag.Diagnostics {
 			return diags
 		}
 		written[replicationPath] = true
+	}
+
+	if clickhouseclient.IsRecordingSQL(ctx) {
+		plan.ID = types.StringValue(database + "." + table)
+		return diags
 	}
 
 	desired, err := r.client.DataChecksum(ctx, database, table, plan.Format.ValueString(), plan.Data.ValueString())
