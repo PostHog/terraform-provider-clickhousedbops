@@ -51,7 +51,7 @@ func decodeSQLPlan(data []byte) (savedSQLPlan, bool) {
 	return saved, err == nil && saved.Version == 1
 }
 
-func setSQLPlanValues(value *tfprotov6.DynamicValue, typ tftypes.Type, digest, report string) (*tfprotov6.DynamicValue, error) {
+func setSQLPlanDigest(value *tfprotov6.DynamicValue, typ tftypes.Type, digest string) (*tfprotov6.DynamicValue, error) {
 	raw, err := value.Unmarshal(typ)
 	if err != nil || raw.IsNull() {
 		return value, err
@@ -61,28 +61,25 @@ func setSQLPlanValues(value *tfprotov6.DynamicValue, typ tftypes.Type, digest, r
 		return nil, err
 	}
 	attributes["sql_plan_digest"] = tftypes.NewValue(tftypes.String, digest)
-	attributes["sql_plan"] = tftypes.NewValue(tftypes.String, report)
 	result, err := tfprotov6.NewDynamicValue(typ, tftypes.NewValue(typ, attributes))
 	return &result, err
 }
 
-func priorSQLPlanValues(value tftypes.Value) (string, string, error) {
+func priorSQLPlanDigest(value tftypes.Value) (string, error) {
 	if value.IsNull() {
-		return "", "", nil
+		return "", nil
 	}
 	var attributes map[string]tftypes.Value
 	if err := value.As(&attributes); err != nil {
-		return "", "", err
+		return "", err
 	}
-	var digest, report string
-	for name, target := range map[string]*string{"sql_plan_digest": &digest, "sql_plan": &report} {
-		if attribute := attributes[name]; attribute.IsKnown() && !attribute.IsNull() {
-			if err := attribute.As(target); err != nil {
-				return "", "", err
-			}
+	var digest string
+	if attribute := attributes["sql_plan_digest"]; attribute.IsKnown() && !attribute.IsNull() {
+		if err := attribute.As(&digest); err != nil {
+			return "", err
 		}
 	}
-	return digest, report, nil
+	return digest, nil
 }
 
 func sqlReport(operations []clickhouseclient.SQLOperation) (string, error) {
@@ -134,13 +131,13 @@ func (s *sqlPlanServer) PlanResourceChange(ctx context.Context, req *tfprotov6.P
 		resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
 		return resp, nil
 	}
-	digest, report, err := priorSQLPlanValues(prior)
+	digest, err := priorSQLPlanDigest(prior)
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
 		return resp, nil
 	}
 	if !s.provider.enforceSQLPlan {
-		resp.PlannedState, err = setSQLPlanValues(resp.PlannedState, typ, digest, report)
+		resp.PlannedState, err = setSQLPlanDigest(resp.PlannedState, typ, digest)
 		if err != nil {
 			resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
 		}
@@ -186,7 +183,7 @@ func (s *sqlPlanServer) PlanResourceChange(ctx context.Context, req *tfprotov6.P
 		recording.Operations = nil
 		preview.PriorState = &null
 	}
-	candidate, err := setSQLPlanValues(resp.PlannedState, typ, digest, report)
+	candidate, err := setSQLPlanDigest(resp.PlannedState, typ, digest)
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
 		return resp, nil
@@ -213,9 +210,6 @@ func (s *sqlPlanServer) PlanResourceChange(ctx context.Context, req *tfprotov6.P
 	all := append(append([]clickhouseclient.SQLOperation{}, saved.Deletes...), saved.Operations...)
 	if len(saved.Operations) > 0 {
 		digest, err = clickhouseclient.SQLPlanDigest(saved.Operations)
-		if err == nil {
-			report, err = sqlReport(saved.Operations)
-		}
 		if err != nil {
 			resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
 			return resp, nil
@@ -232,7 +226,7 @@ func (s *sqlPlanServer) PlanResourceChange(ctx context.Context, req *tfprotov6.P
 
 	resp.PlannedPrivate, err = json.Marshal(saved)
 	if err == nil {
-		resp.PlannedState, err = setSQLPlanValues(resp.PlannedState, typ, digest, report)
+		resp.PlannedState, err = setSQLPlanDigest(resp.PlannedState, typ, digest)
 	}
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
@@ -257,7 +251,7 @@ func (s *sqlPlanServer) ApplyResourceChange(ctx context.Context, req *tfprotov6.
 		return nil, err
 	}
 	if !planned.IsNull() {
-		digest, _, err := priorSQLPlanValues(planned)
+		digest, err := priorSQLPlanDigest(planned)
 		if len(saved.Operations) > 0 {
 			expected, digestErr := clickhouseclient.SQLPlanDigest(saved.Operations)
 			if err != nil || digestErr != nil || digest != expected {

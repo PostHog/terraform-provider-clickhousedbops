@@ -97,7 +97,6 @@ resource "clickhousedbops_materialized_view" "events_daily_mv" {
 - `id` (String) Stable identifier in the form cluster:database.materialized view or database.materialized view
 - `nodes` (List of String) Hosts where the materialized view exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified name in the form database.materialized view
-- `sql_plan` (String) Reviewed writes, in execution order per target. Parameter values and dictionary sources are redacted.
 - `sql_plan_digest` (String) Digest of the reviewed SQL operations. When enforce_sql_plan is enabled, an apply cannot expand a known SQL plan.
 
 <a id="nestedatt--columns"></a>

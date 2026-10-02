@@ -41,7 +41,6 @@ type Resource struct {
 
 type model struct {
 	SQLPlanDigest types.String `tfsdk:"sql_plan_digest"`
-	SQLPlan       types.String `tfsdk:"sql_plan"`
 	ID            types.String `tfsdk:"id"`
 	Database      types.String `tfsdk:"database"`
 	Table         types.String `tfsdk:"table"`
@@ -62,7 +61,6 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 	resp.Schema = schema.Schema{
 		MarkdownDescription: description,
 		Attributes: map[string]schema.Attribute{
-			"sql_plan":        schema.StringAttribute{Computed: true, Description: "Reviewed writes, in execution order per target. Parameter values and dictionary sources are redacted."},
 			"sql_plan_digest": schema.StringAttribute{Computed: true, Description: "Digest of the reviewed SQL operations."},
 			"id": schema.StringAttribute{
 				Computed:      true,

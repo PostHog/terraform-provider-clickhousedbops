@@ -456,7 +456,6 @@ func optionalStringValue(value *string) types.String {
 // (table, view, materialized_view, dictionary). The objectType parameter is used in descriptions.
 func CommonSchemaAttributes(objectType string) map[string]schema.Attribute {
 	return map[string]schema.Attribute{
-		"sql_plan":        schema.StringAttribute{Computed: true, Description: "Reviewed writes, in execution order per target. Parameter values and dictionary sources are redacted."},
 		"sql_plan_digest": schema.StringAttribute{Computed: true, Description: "Digest of the reviewed SQL operations. When enforce_sql_plan is enabled, an apply cannot expand a known SQL plan."},
 		"cluster_name": schema.StringAttribute{
 			Optional:    true,

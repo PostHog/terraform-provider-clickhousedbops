@@ -240,10 +240,10 @@ resource "clickhousedbops_dictionary" "ids" {
 		defer mu.Unlock()
 		return append([]clickhouseclient.SQLOperation{}, writes...)
 	}
-	plan := func(extra ...string) {
+	plan := func(extra ...string) []clickhouseclient.SQLOperation {
 		t.Helper()
 		before := len(snapshot())
-		args := append([]string{"plan", "-no-color", "-out=reviewed.tfplan"}, extra...)
+		args := append([]string{"plan", "-json", "-out=reviewed.tfplan"}, extra...)
 		output := mustRun(args...)
 		if len(snapshot()) != before {
 			t.Fatalf("planning sent writes: %#v", snapshot()[before:])
@@ -251,32 +251,36 @@ resource "clickhousedbops_dictionary" "ids" {
 		if !strings.Contains(output, "Reviewed SQL execution plan") {
 			t.Fatalf("plan did not print SQL: %s", output)
 		}
+		var reviewed []clickhouseclient.SQLOperation
+		for _, line := range strings.Split(output, "\n") {
+			if !strings.HasPrefix(line, "{") {
+				continue
+			}
+			var event struct {
+				Diagnostic struct {
+					Summary string `json:"summary"`
+					Detail  string `json:"detail"`
+				} `json:"diagnostic"`
+			}
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Diagnostic.Summary == "Reviewed SQL execution plan" {
+				var operations []clickhouseclient.SQLOperation
+				if err := json.Unmarshal([]byte(event.Diagnostic.Detail), &operations); err != nil {
+					t.Fatal(err)
+				}
+				reviewed = append(reviewed, operations...)
+			}
+		}
+		return reviewed
 	}
 	apply := func() { t.Helper(); mustRun("apply", "-no-color", "reviewed.tfplan") }
 	writeConfig(table + objects)
-	plan()
-	jsonPlan := mustRun("show", "-json", "reviewed.tfplan")
-	var shown struct {
-		PlannedValues struct {
-			RootModule struct {
-				Resources []struct {
-					Values struct {
-						SQLPlan string `json:"sql_plan"`
-					} `json:"values"`
-				} `json:"resources"`
-			} `json:"root_module"`
-		} `json:"planned_values"`
-	}
-	if err := json.Unmarshal([]byte(jsonPlan[strings.Index(jsonPlan, "{"):]), &shown); err != nil {
-		t.Fatal(err)
-	}
-	var reviewed []clickhouseclient.SQLOperation
-	for _, resource := range shown.PlannedValues.RootModule.Resources {
-		var operations []clickhouseclient.SQLOperation
-		if err := json.Unmarshal([]byte(resource.Values.SQLPlan), &operations); err != nil {
-			t.Fatal(err)
-		}
-		reviewed = append(reviewed, operations...)
+	reviewed := plan()
+	shown := mustRun("show", "-no-color", "reviewed.tfplan")
+	if !strings.Contains(shown, "columns") || strings.Contains(shown, "sql_plan ") || strings.Contains(shown, "CREATE TABLE") {
+		t.Fatalf("SQL replaced or polluted the resource diff: %s", shown)
 	}
 	apply()
 	for _, actual := range snapshot() {
