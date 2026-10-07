@@ -95,19 +95,6 @@ func TestSQLPlanSavedFile(t *testing.T) {
 		query("DROP TABLE " + database + ".partition_probe SYNC")
 	}
 
-	secondary := os.Getenv("SQL_PLAN_TEST_SECOND_CLICKHOUSE_URL")
-	var secondaryProxy *httputil.ReverseProxy
-	if secondary != "" {
-		secondURL, err := url.Parse(secondary)
-		if err != nil {
-			t.Fatal(err)
-		}
-		secondaryProxy = httputil.NewSingleHostReverseProxy(secondURL) //nolint:gosec // Explicit disposable test endpoint.
-		queryEndpoint(secondary, "CREATE DATABASE "+database)
-		t.Cleanup(func() { queryEndpoint(secondary, "DROP DATABASE "+database+" SYNC") })
-		queryEndpoint(secondary, "CREATE TABLE "+database+".sink (id UInt64) ENGINE Memory")
-	}
-
 	var mu sync.Mutex
 	var writes []clickhouseclient.SQLOperation
 	proxy := httputil.NewSingleHostReverseProxy(upstream) //nolint:gosec // Opt-in test endpoint, never a production request.
@@ -120,14 +107,6 @@ func TestSQLPlanSavedFile(t *testing.T) {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(data))
 		sql := string(data)
-		if secondaryProxy != nil && strings.Contains(strings.ReplaceAll(sql, "`", ""), "FROM system.clusters") {
-			_, err := io.WriteString(w, `{"meta":[{"name":"host_name","type":"String"},{"name":"host_address","type":"String"},{"name":"port","type":"UInt64"},{"name":"shard_num","type":"UInt64"},{"name":"replica_num","type":"UInt64"}],"data":[["node1","127.0.0.1","9000","1","1"],["node2","localhost","9000","2","1"]]}`)
-			if err != nil {
-				t.Error(err)
-			}
-			return
-		}
-
 		if !strings.HasPrefix(sql, "SELECT ") && !strings.HasPrefix(sql, "SHOW ") && !strings.HasPrefix(sql, "EXISTS ") {
 			var params map[string]string
 			for key, values := range r.URL.Query() {
@@ -142,11 +121,7 @@ func TestSQLPlanSavedFile(t *testing.T) {
 			writes = append(writes, clickhouseclient.SQLOperation{SQL: sql, Parameters: params})
 			mu.Unlock()
 		}
-		if secondaryProxy != nil && strings.HasPrefix(r.Host, "localhost:") {
-			secondaryProxy.ServeHTTP(w, r)
-		} else {
-			proxy.ServeHTTP(w, r)
-		}
+		proxy.ServeHTTP(w, r)
 	}))
 	defer server.Close()
 	dir := t.TempDir()
@@ -176,9 +151,6 @@ provider "clickhousedbops" {
  enforce_sql_plan = true
 }
 `, u.Port())
-	if secondaryProxy != nil {
-		header = strings.Replace(header, "enforce_sql_plan = true", "enforce_sql_plan = true\n fanout_cluster = \"sql_plan_test\"", 1)
-	}
 	table := fmt.Sprintf(`resource "clickhousedbops_table" "events" {
  database = %q
  name = "events"
@@ -328,19 +300,11 @@ resource "clickhousedbops_dictionary" "ids" {
 	if result := query("SELECT count() FROM " + database + ".events"); result != "1\n" {
 		t.Fatalf("contents not applied: %q", result)
 	}
-	if secondaryProxy != nil {
-		if result := queryEndpoint(secondary, "SELECT count() FROM "+database+".events"); result != "1\n" {
-			t.Fatalf("fanout missed second node: %q", result)
-		}
-	}
 	// Apply-time live drift must never invent a compensating ADD COLUMN.
 	changed := strings.Replace(replaced, `{ name = "extra", type = "String" }`, `{ name = "extra", type = "String" }, { name = "reviewed", type = "String" }`, 1)
 	writeConfig(changed + objects)
 	plan()
 	query("ALTER TABLE " + database + ".events DROP COLUMN extra")
-	if secondaryProxy != nil {
-		queryEndpoint(secondary, "ALTER TABLE "+database+".events DROP COLUMN extra")
-	}
 	before := len(snapshot())
 	output, err = run("apply", "-no-color", "reviewed.tfplan")
 	if err == nil {

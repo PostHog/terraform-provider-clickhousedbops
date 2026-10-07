@@ -27,6 +27,11 @@ import (
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/schemahelpers"
 )
 
+const (
+	replicaRoleLeader   = "leader"
+	replicaRoleFollower = "follower"
+)
+
 //go:embed table.md
 var tableResourceDescription string
 
@@ -124,6 +129,13 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 			stringplanmodifier.RequiresReplace(),
 		},
 	}
+	attrs["replica_role"] = schema.StringAttribute{
+		Optional: true,
+		Description: "For one replica of a Replicated table: \"leader\" runs the ALTERs that reach every replica of the shard through Keeper; " +
+			"\"follower\" waits for those to arrive and changes only its own settings, and fails if its table still differs. " +
+			"Apply followers after their leader. If omitted, the node runs every ALTER, as a leader does.",
+		Validators: []validator.String{stringvalidator.OneOf(replicaRoleLeader, replicaRoleFollower)},
+	}
 	attrs["force_destroy"] = schema.BoolAttribute{
 		Optional: true,
 		Computed: true,
@@ -158,6 +170,12 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 	if req.Plan.Raw.IsNull() {
+		client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+		resp.Diagnostics.Append(nodeDiags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		r = &Resource{client: client}
 		var state TableResourceModel
 		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 		if !resp.Diagnostics.HasError() {
@@ -172,10 +190,12 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
-	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, plan.ClusterName, &resp.Plan)...)
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	r = &Resource{client: client}
 
 	desiredTable, err := expandTableModel(ctx, plan)
 	resp.Diagnostics.Append(schemahelpers.DiagnosticsFromErr("Invalid table configuration", err)...)
@@ -264,9 +284,9 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
-	states, converged, diags := schemahelpers.PlanNodeStates(ctx, r.client, plan,
-		func(ctx context.Context, client dbops.Client) (*dbops.Table, error) {
-			remote, err := client.GetTable(ctx, desiredTable.Database, desiredTable.Name, plan.ClusterName.ValueStringPointer())
+	remoteState, converged, diags := schemahelpers.PlanObject(ctx, plan,
+		func(ctx context.Context) (*dbops.Table, error) {
+			remote, err := r.client.GetTable(ctx, desiredTable.Database, desiredTable.Name, plan.ClusterName.ValueStringPointer())
 			if err != nil || remote == nil {
 				return nil, err
 			}
@@ -289,8 +309,8 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	if !converged {
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
 	}
-	for _, candidate := range states {
-		remote, err := expandTableModel(ctx, candidate)
+	if remoteState != nil {
+		remote, err := expandTableModel(ctx, *remoteState)
 		if err != nil {
 			resp.Diagnostics.AddError("Invalid remote table", err.Error())
 			return
@@ -341,15 +361,19 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		}
 	}
 
-	// Nothing to run on any node: the create statement stays what it is.
-	var plannedNodes types.List
-	resp.Diagnostics.Append(resp.Plan.GetAttribute(ctx, path.Root("nodes"), &plannedNodes)...)
-	if converged && len(updatePlan.ReplaceAttrs) == 0 && len(updatePlan.ActionGroups) == 0 && plannedNodes.Equal(state.Nodes) {
+	// Nothing to run: the create statement stays what it is.
+	if converged && len(updatePlan.ReplaceAttrs) == 0 && len(updatePlan.ActionGroups) == 0 {
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), state.CreateStatement)...)
 	}
 }
 
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan TableResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -368,6 +392,12 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 }
 
 func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var state TableResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -382,9 +412,9 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	newState, table, nodes, diags := schemahelpers.ReadNodes(ctx, r.client, state,
-		func(ctx context.Context, client dbops.Client) (*dbops.Table, error) {
-			table, err := client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	newState, table, diags := schemahelpers.ReadObject(ctx, state,
+		func(ctx context.Context) (*dbops.Table, error) {
+			table, err := r.client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
 			if err != nil || table == nil {
 				return nil, err
 			}
@@ -425,7 +455,6 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	newState.Nodes = nodes
 	// An imported table, or one from before these attributes existed, gets their defaults, so
 	// that the first plan does not show them as a change.
 	if newState.ForceDestroy.IsNull() {
@@ -439,6 +468,12 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan TableResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -457,6 +492,12 @@ func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp 
 }
 
 func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var state TableResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
@@ -468,9 +509,9 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 		return
 	}
 
-	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
-		return client.DeleteTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer(), state.IgnoreDropDependencies.ValueBool())
-	})...)
+	if err := r.client.DeleteTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer(), state.IgnoreDropDependencies.ValueBool()); err != nil {
+		resp.Diagnostics.AddError("Error deleting table", fmt.Sprintf("%+v\n", err))
+	}
 }
 
 // checkMutations fails on a mutation of the table that keeps failing. Its ALTER already changed
@@ -478,32 +519,24 @@ func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp 
 // mutation blocks merges of the parts it cannot rewrite.
 func (r *Resource) checkMutations(ctx context.Context, database string, name string) diag.Diagnostics {
 	var diags diag.Diagnostics
-	nodes, err := r.client.SchemaNodes(ctx)
+	failing, err := r.client.FailingMutations(ctx, database, name)
 	if err != nil {
-		diags.AddError("Error listing cluster nodes", fmt.Sprintf("%+v\n", err))
+		diags.AddError("Error reading mutations", fmt.Sprintf("%+v\n", err))
 		return diags
 	}
-	for _, node := range nodes {
-		failing, err := node.Client.FailingMutations(ctx, database, name)
-		if err != nil {
-			diags.AddError(fmt.Sprintf("Error reading mutations on node %q", node.Host), fmt.Sprintf("%+v\n", err))
-			return diags
-		}
-		for _, mutation := range failing {
-			diags.AddError(
-				"Failing mutation on "+schemahelpers.QualifiedName(database, name),
-				fmt.Sprintf("Node %q: mutation %s (%s) fails: %s. Fix the cause, or stop it with %s.", node.Host, mutation.ID, mutation.Command, mutation.Reason, mutation.KillHint(database, name)),
-			)
-		}
+	for _, mutation := range failing {
+		diags.AddError(
+			"Failing mutation on "+schemahelpers.QualifiedName(database, name),
+			fmt.Sprintf("Mutation %s (%s) fails: %s. Fix the cause, or stop it with %s.", mutation.ID, mutation.Command, mutation.Reason, mutation.KillHint(database, name)),
+		)
 	}
 	return diags
 }
 
-// recreateOnNode drops a table that cannot be altered into the configured one and creates it
-// again. It keeps the data-loss guard: a MergeTree-family table with rows is only dropped with
+// recreate drops a table that cannot be altered into the configured one and creates it again. It keeps the data-loss guard: a MergeTree-family table with rows is only dropped with
 // force_destroy.
-func (r *Resource) recreateOnNode(ctx context.Context, node dbops.SchemaNode, desired dbops.Table, clusterName *string, forceDestroy bool) error {
-	existing, err := node.Client.GetTable(ctx, desired.Database, desired.Name, clusterName)
+func (r *Resource) recreate(ctx context.Context, desired dbops.Table, clusterName *string, forceDestroy bool) error {
+	existing, err := r.client.GetTable(ctx, desired.Database, desired.Name, clusterName)
 	if err != nil {
 		return err
 	}
@@ -518,7 +551,7 @@ func (r *Resource) recreateOnNode(ctx context.Context, node dbops.SchemaNode, de
 	}
 	if !forceDestroy {
 		if existing != nil && strings.HasSuffix(strings.ToLower(tableengine.BaseName(existing.Engine)), "mergetree") {
-			rows, err := node.Client.TableRows(ctx, desired.Database, desired.Name)
+			rows, err := r.client.TableRows(ctx, desired.Database, desired.Name)
 			if err != nil {
 				return err
 			}
@@ -527,14 +560,14 @@ func (r *Resource) recreateOnNode(ctx context.Context, node dbops.SchemaNode, de
 			}
 		}
 	}
-	if err := node.Client.DeleteTable(ctx, desired.Database, desired.Name, clusterName, true); err != nil {
+	if err := r.client.DeleteTable(ctx, desired.Database, desired.Name, clusterName, true); err != nil {
 		return err
 	}
-	_, err = node.Client.CreateTable(ctx, desired, clusterName)
+	_, err = r.client.CreateTable(ctx, desired, clusterName)
 	return err
 }
 
-// guardDataLoss refuses to drop a MergeTree-family table that holds rows on any node, unless
+// guardDataLoss refuses to drop a MergeTree-family table that holds rows, unless
 // force_destroy is true in state. It runs when the plan is made, so that a pull request shows the
 // refusal, and again before the drop.
 func (r *Resource) guardDataLoss(ctx context.Context, state TableResourceModel, action string) diag.Diagnostics {
@@ -543,35 +576,27 @@ func (r *Resource) guardDataLoss(ctx context.Context, state TableResourceModel, 
 		return diags
 	}
 
-	nodes, err := r.client.SchemaNodes(ctx)
+	var holding []string
+	table, err := r.client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
 	if err != nil {
-		diags.AddError("Error listing cluster nodes", fmt.Sprintf("%+v\n", err))
+		diags.AddError("Error reading table", err.Error())
 		return diags
 	}
-	var holding []string
-	for _, node := range nodes {
-		table, err := node.Client.GetTable(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	if table != nil && strings.HasSuffix(strings.ToLower(tableengine.BaseName(table.Engine)), "mergetree") {
+		rows, err := r.client.TableRows(ctx, state.Database.ValueString(), state.Name.ValueString())
 		if err != nil {
-			diags.AddError(fmt.Sprintf("Error reading table on node %q", node.Host), err.Error())
-			return diags
-		}
-		if table == nil || !strings.HasSuffix(strings.ToLower(tableengine.BaseName(table.Engine)), "mergetree") {
-			continue
-		}
-		rows, err := node.Client.TableRows(ctx, state.Database.ValueString(), state.Name.ValueString())
-		if err != nil {
-			diags.AddError(fmt.Sprintf("Error reading rows on node %q", node.Host), fmt.Sprintf("%+v\n", err))
+			diags.AddError("Error reading rows", fmt.Sprintf("%+v\n", err))
 			return diags
 		}
 		if rows > 0 {
-			holding = append(holding, fmt.Sprintf("%s (%d rows)", node.Host, rows))
+			holding = append(holding, fmt.Sprintf("%d rows", rows))
 		}
 	}
 	if len(holding) > 0 {
 		name := schemahelpers.QualifiedName(state.Database.ValueString(), state.Name.ValueString())
 		diags.AddError(
 			fmt.Sprintf("Refusing to %s %s, which holds data", action, name),
-			fmt.Sprintf("%s holds rows on %s. Dropping it loses them. If that is intended, set force_destroy = true on this table and apply that first; the next plan can then %s it. Otherwise change the configuration so that the table is altered in place.",
+			fmt.Sprintf("%s holds %s. Dropping it loses them. If that is intended, set force_destroy = true on this table and apply that first; the next plan can then %s it. Otherwise change the configuration so that the table is altered in place.",
 				name, strings.Join(holding, ", "), action),
 		)
 	}
@@ -582,8 +607,8 @@ func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequ
 	schemahelpers.ImportSchemaObjectState(ctx, req, resp)
 }
 
-// convergeTable makes every node hold the planned table: it alters existing tables in place
-// and creates the table where it is missing.
+// convergeTable makes the node hold the planned table: it alters an existing table in place
+// or creates it.
 func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, adopt bool, recreate bool, forceDestroy bool) (*TableResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
@@ -606,23 +631,24 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 	// SETTING and RESET SETTING, which change only the replica that runs them.
 	replicated := strings.HasPrefix(strings.ToLower(tableengine.BaseName(desired.Engine)), "replicated")
 
-	table, nodes, convergeDiags := schemahelpers.ConvergeNodes(ctx, r.client, adopt, schemahelpers.NodeConverger[dbops.Table]{
+	follower := plan.ReplicaRole.ValueString() == replicaRoleFollower
+	table, convergeDiags := schemahelpers.Converge(ctx, adopt, schemahelpers.Converger[dbops.Table]{
 		Kind:          "table",
 		QualifiedName: schemahelpers.QualifiedName(desired.Database, desired.Name),
-		Get: func(ctx context.Context, client dbops.Client) (*dbops.Table, error) {
-			return client.GetTable(ctx, desired.Database, desired.Name, clusterName)
-		},
-		Create: func(ctx context.Context, client dbops.Client, reference *dbops.Table) error {
-			table := desired
-			if replicated && reference != nil {
-				// A new replica must declare the structure that Keeper holds for the shard:
-				// the same indexes in the same order, and the unmanaged columns and indexes.
-				table.Columns, table.Indexes, table.Projections, table.Constraints = reference.Columns, reference.Indexes, reference.Projections, reference.Constraints
+		Get: func(ctx context.Context) (*dbops.Table, error) {
+			if replicated && follower {
+				// The leader's ALTERs reach this replica through Keeper; read it once they have.
+				if err := r.client.WaitForReplicaMetadata(ctx, desired.Database, desired.Name); err != nil {
+					return nil, err
+				}
 			}
-			_, err := client.CreateTable(ctx, table, clusterName)
+			return r.client.GetTable(ctx, desired.Database, desired.Name, clusterName)
+		},
+		Create: func(ctx context.Context) error {
+			_, err := r.client.CreateTable(ctx, desired, clusterName)
 			return err
 		},
-		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.Table) error {
+		Reconcile: func(ctx context.Context, existing *dbops.Table) error {
 			remote := filterUnmanaged(*existing, desired, columnPatterns, indexPatterns)
 			if r.client.IgnoreColumnOrder() {
 				remote.Columns = alignColumnOrder(remote.Columns, desired.Columns)
@@ -632,8 +658,8 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 				return err
 			}
 
-			// The node's table is read the way Read reads it, so that text that is only
-			// formatted differently from the plan is not a change.
+			// The table is read the way Read reads it, so that text that is only formatted
+			// differently from the plan is not a change.
 			candidate := plan
 			if syncDiags := syncTableState(ctx, &candidate, &remote, settingCapabilities); syncDiags.HasError() {
 				return schemahelpers.DiagnosticsError(syncDiags)
@@ -651,22 +677,29 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 				updatePlan.ReplaceAttrs["engine"] = struct{}{}
 			}
 			if len(updatePlan.ReplaceAttrs) > 0 && recreate {
-				return r.recreateOnNode(ctx, node, desired, clusterName, forceDestroy)
+				return r.recreate(ctx, desired, clusterName, forceDestroy)
 			}
 			if len(updatePlan.ReplaceAttrs) > 0 {
 				return fmt.Errorf("the table differs from the desired definition in attributes that cannot be changed in place: %s. Replace the table or change the configuration to match it",
 					strings.Join(slices.Sorted(maps.Keys(updatePlan.ReplaceAttrs)), ", "))
 			}
 
-			for _, actionGroup := range updatePlan.ActionGroups {
-				running, err := node.Client.AlterTable(ctx, desired.Database, desired.Name, clusterName, actionGroup)
+			actionGroups := updatePlan.ActionGroups
+			if replicated && follower {
+				if len(updatePlan.ActionGroups) > len(updatePlan.SettingGroups) {
+					return fmt.Errorf("the replica still differs from the configuration after the shard's metadata arrived from Keeper. Its leader has not applied the change: apply the leader first")
+				}
+				actionGroups = updatePlan.SettingGroups
+			}
+			for _, actionGroup := range actionGroups {
+				running, err := r.client.AlterTable(ctx, desired.Database, desired.Name, clusterName, actionGroup)
 				if err != nil {
 					return err
 				}
 				for _, mutation := range running {
 					diags.AddWarning(
 						"Mutation running on "+schemahelpers.QualifiedName(desired.Database, desired.Name),
-						fmt.Sprintf("Node %q: mutation %s (%s) has %d parts left. It continues in the background; see system.mutations.", node.Host, mutation.ID, mutation.Command, mutation.PartsToDo),
+						fmt.Sprintf("Mutation %s (%s) has %d parts left. It continues in the background; see system.mutations.", mutation.ID, mutation.Command, mutation.PartsToDo),
 					)
 				}
 			}
@@ -675,7 +708,7 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 				if err != nil {
 					return err
 				}
-				clickhouseclient.SetPreviewObject(ctx, node.Host, "table", desired.Database, desired.Name, &preview)
+				clickhouseclient.SetPreviewObject(ctx, r.client.Host(), "table", desired.Database, desired.Name, &preview)
 			}
 
 			return nil
@@ -687,7 +720,6 @@ func (r *Resource) convergeTable(ctx context.Context, plan TableResourceModel, a
 	}
 
 	state := plan
-	state.Nodes = nodes
 	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, table.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
 
 	return &state, diags

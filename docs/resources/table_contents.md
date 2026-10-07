@@ -58,8 +58,24 @@ resource "clickhousedbops_table_contents" "country" {
 - `format` (String) ClickHouse input format of data, for example JSONEachRow or CSVWithNames.
 - `table` (String) Table whose rows this resource declares. It must be a MergeTree or ReplicatedMergeTree table.
 
+### Optional
+
+- `node` (Attributes) The ClickHouse server the table contents lives on. If omitted, the table contents lives on the provider's host. The connection uses the provider's protocol, credentials and TLS settings. (see [below for nested schema](#nestedatt--node))
+
 ### Read-Only
 
 - `checksum` (String) Row count and an order-independent hash of the rows. In state it is what the table holds; in the plan it is what data holds.
 - `id` (String) database.table
 - `sql_plan_digest` (String) Digest of the reviewed SQL operations.
+
+<a id="nestedatt--node"></a>
+### Nested Schema for `node`
+
+Required:
+
+- `host` (String) Address to connect to. Changing it reconnects without replacing the object.
+- `name` (String) Stable name of the server. A different name is a different server, so changing it replaces the object.
+
+Optional:
+
+- `port` (Number) Port to connect to. Defaults to the provider's port.

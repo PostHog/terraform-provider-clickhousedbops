@@ -233,3 +233,28 @@ func TestSyncOptionalString(t *testing.T) {
 		}
 	})
 }
+
+func TestImportNode(t *testing.T) {
+	for _, tc := range []struct {
+		ref, name, host string
+		port            int32
+		wantErr         bool
+	}{
+		{ref: "ch-1a@10.0.0.1", name: "ch-1a", host: "10.0.0.1"},
+		{ref: "ch-1a@10.0.0.1:9440", name: "ch-1a", host: "10.0.0.1", port: 9440},
+		{ref: "ch-1a@", wantErr: true},
+		{ref: "@10.0.0.1", wantErr: true},
+		{ref: "ch-1a@10.0.0.1:port", wantErr: true},
+	} {
+		node, err := importNode(tc.ref)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: err=%v, wantErr=%v", tc.ref, err, tc.wantErr)
+		}
+		if tc.wantErr {
+			continue
+		}
+		if node.Name.ValueString() != tc.name || node.Host.ValueString() != tc.host || (tc.port == 0) != node.Port.IsNull() || (tc.port != 0 && node.Port.ValueInt32() != tc.port) {
+			t.Fatalf("%s: got %v", tc.ref, node)
+		}
+	}
+}

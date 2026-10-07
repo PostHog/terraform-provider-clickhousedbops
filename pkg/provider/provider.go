@@ -147,13 +147,6 @@ func (p *Provider) Schema(ctx context.Context, req provider.SchemaRequest, resp 
 					int64validator.AtLeast(1),
 				},
 			},
-			"fanout_cluster": schema.StringAttribute{
-				Optional:    true,
-				Description: "Name of a cluster in system.clusters. When set, the table, view, materialized_view and dictionary resources connect to every node of this cluster and run their DDL on each node, without ON CLUSTER. The nodes are reached at the host_address that system.clusters reports, which the server resolved from host_name, so the caller does not need to resolve node names; set tls_config.server_name when certificates are verified. They use the protocol, authentication, TLS and timeouts of this provider. The port is the one from system.clusters for the native protocol and the configured port for every other protocol.",
-				Validators: []validator.String{
-					stringvalidator.LengthAtLeast(1),
-				},
-			},
 			"adopt_existing": schema.BoolAttribute{
 				Optional:    true,
 				Description: "When true, creating a table, view, materialized view or dictionary that already exists adopts it: the existing object is changed in place to match the configuration. When false (the default), creating an object that already exists is an error.",
@@ -380,16 +373,14 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 	if !data.ReadAfterWriteTimeout.IsNull() {
 		dbopsOpts = append(dbopsOpts, dbops.WithReadAfterWriteTimeout(time.Duration(data.ReadAfterWriteTimeout.ValueInt64())*time.Second))
 	}
-	if !data.FanoutCluster.IsNull() {
-		dbopsOpts = append(dbopsOpts, dbops.WithFanout(data.FanoutCluster.ValueString(), func(address string, clusterPort uint16) (clickhouseclient.ClickhouseClient, error) {
-			// system.clusters reports the native protocol port of each node. Every other
-			// protocol uses the port of the provider configuration.
-			if data.Protocol.ValueString() == protocolNative {
-				return newClickhouseClient(address, clusterPort)
-			}
-			return newClickhouseClient(address, port)
-		}))
-	}
+	// Schema resources that name a node connect to it with this provider's protocol,
+	// credentials, TLS settings and timeouts.
+	dbopsOpts = append(dbopsOpts, dbops.WithNodeFactory(func(host string, nodePort uint16) (clickhouseclient.ClickhouseClient, error) {
+		if nodePort == 0 {
+			nodePort = port
+		}
+		return newClickhouseClient(host, nodePort)
+	}))
 
 	dbopsClient, err := dbops.NewClient(clickhouseClient, dbopsOpts...)
 	if err != nil {

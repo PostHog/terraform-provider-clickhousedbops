@@ -5,8 +5,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -20,6 +18,7 @@ import (
 
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/clickhouseclient"
 	"github.com/ClickHouse/terraform-provider-clickhousedbops/internal/dbops"
+	"github.com/ClickHouse/terraform-provider-clickhousedbops/pkg/resource/schemahelpers"
 )
 
 //go:embed tablecontents.md
@@ -47,10 +46,8 @@ type model struct {
 	Format        types.String `tfsdk:"format"`
 	Data          types.String `tfsdk:"data"`
 	Checksum      types.String `tfsdk:"checksum"`
+	Node          types.Object `tfsdk:"node"`
 }
-
-// A checksum that no data can have, for a table whose nodes disagree.
-const nodesDiffer = "nodes differ"
 
 func (r *Resource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_table_contents"
@@ -92,6 +89,7 @@ func (r *Resource) Schema(_ context.Context, _ resource.SchemaRequest, resp *res
 				Computed:    true,
 				Description: "Row count and an order-independent hash of the rows. In state it is what the table holds; in the plan it is what data holds.",
 			},
+			"node": schemahelpers.NodeAttribute("table contents"),
 		},
 	}
 }
@@ -109,6 +107,12 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	if req.Plan.Raw.IsNull() || r.client == nil {
 		return
 	}
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan model
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() || plan.Data.IsUnknown() || plan.Format.IsUnknown() || plan.Database.IsUnknown() || plan.Table.IsUnknown() {
@@ -142,6 +146,12 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 }
 
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan model
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -155,6 +165,12 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan model
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -168,12 +184,18 @@ func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp 
 }
 
 func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var state model
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	checksum, exists, diags := r.nodesChecksum(ctx, state.Database.ValueString(), state.Table.ValueString())
+	checksum, exists, diags := r.checksum(ctx, state.Database.ValueString(), state.Table.ValueString())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -190,33 +212,15 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 // the table. Dropping the table removes them.
 func (r *Resource) Delete(context.Context, resource.DeleteRequest, *resource.DeleteResponse) {}
 
-// write loads the data on every node that holds its own copy of the rows: each node of a
-// non-replicated table, and one replica per shard of a Replicated one. It then checks that every
-// node holds exactly the data.
+// write replaces the rows of the table with the data, then checks that the table holds exactly
+// the data.
 func (r *Resource) write(ctx context.Context, plan *model) diag.Diagnostics {
 	var diags diag.Diagnostics
 	database, table := plan.Database.ValueString(), plan.Table.ValueString()
 
-	nodes, err := r.client.SchemaNodes(ctx)
-	if err != nil {
-		diags.AddError("Error listing cluster nodes", fmt.Sprintf("%+v\n", err))
+	if err := r.client.ReplaceTableContents(ctx, database, table, plan.Format.ValueString(), plan.Data.ValueString()); err != nil {
+		diags.AddError(fmt.Sprintf("Error writing the contents of %s.%s", database, table), fmt.Sprintf("%+v\n", err))
 		return diags
-	}
-	written := map[string]bool{}
-	for _, node := range nodes {
-		replicationPath, err := node.Client.ReplicationPath(ctx, database, table)
-		if err != nil {
-			diags.AddError(fmt.Sprintf("Error reading %s.%s on node %q", database, table, node.Host), fmt.Sprintf("%+v\n", err))
-			return diags
-		}
-		if replicationPath != "" && written[replicationPath] {
-			continue
-		}
-		if err := node.Client.ReplaceTableContents(ctx, database, table, plan.Format.ValueString(), plan.Data.ValueString()); err != nil {
-			diags.AddError(fmt.Sprintf("Error writing the contents of %s.%s on node %q", database, table, node.Host), fmt.Sprintf("%+v\n", err))
-			return diags
-		}
-		written[replicationPath] = true
 	}
 
 	if clickhouseclient.IsRecordingSQL(ctx) {
@@ -229,7 +233,7 @@ func (r *Resource) write(ctx context.Context, plan *model) diag.Diagnostics {
 		diags.AddError("Error reading the declared data", fmt.Sprintf("%+v\n", err))
 		return diags
 	}
-	actual, _, readDiags := r.nodesChecksum(ctx, database, table)
+	actual, _, readDiags := r.checksum(ctx, database, table)
 	diags.Append(readDiags...)
 	if diags.HasError() {
 		return diags
@@ -246,44 +250,12 @@ func (r *Resource) write(ctx context.Context, plan *model) diag.Diagnostics {
 	return diags
 }
 
-// nodesChecksum returns the checksum every node agrees on, or nodesDiffer.
-func (r *Resource) nodesChecksum(ctx context.Context, database string, table string) (string, bool, diag.Diagnostics) {
+// checksum returns the checksum of the table's rows, and whether the table exists.
+func (r *Resource) checksum(ctx context.Context, database string, table string) (string, bool, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	nodes, err := r.client.SchemaNodes(ctx)
+	checksum, exists, err := r.client.TableContentsChecksum(ctx, database, table)
 	if err != nil {
-		diags.AddError("Error listing cluster nodes", fmt.Sprintf("%+v\n", err))
-		return "", false, diags
+		diags.AddError(fmt.Sprintf("Error reading the contents of %s.%s", database, table), fmt.Sprintf("%+v\n", err))
 	}
-	byChecksum := map[string][]string{}
-	var missing []string
-	for _, node := range nodes {
-		checksum, exists, err := node.Client.TableContentsChecksum(ctx, database, table)
-		if err != nil {
-			diags.AddError(fmt.Sprintf("Error reading the contents of %s.%s on node %q", database, table, node.Host), fmt.Sprintf("%+v\n", err))
-			return "", false, diags
-		}
-		if !exists {
-			missing = append(missing, node.Host)
-			continue
-		}
-		byChecksum[checksum] = append(byChecksum[checksum], node.Host)
-	}
-	if len(byChecksum) == 0 {
-		return "", false, diags
-	}
-	if len(byChecksum) == 1 && len(missing) == 0 {
-		for checksum := range byChecksum {
-			return checksum, true, diags
-		}
-	}
-	var groups []string
-	if len(missing) > 0 {
-		groups = append(groups, "table missing on "+strings.Join(missing, ", "))
-	}
-	for checksum, hosts := range byChecksum {
-		groups = append(groups, fmt.Sprintf("%s on %s", checksum, strings.Join(hosts, ", ")))
-	}
-	sort.Strings(groups)
-	diags.AddWarning(fmt.Sprintf("The nodes hold different contents of %s.%s", database, table), strings.Join(groups, "; "))
-	return nodesDiffer, true, diags
+	return checksum, exists, diags
 }

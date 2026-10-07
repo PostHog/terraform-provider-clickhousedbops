@@ -42,7 +42,7 @@ Set `enforce_sql_plan = true` on the provider configuration that manages your sc
 
 ```hcl
 provider "clickhousedbops" {
-  # Existing connection, authentication and optional fanout_cluster settings.
+  # Existing connection and authentication settings.
   enforce_sql_plan = true
 }
 ```
@@ -57,7 +57,7 @@ Before sending a write, the client checks its SQL, target, bound values, count a
 
 Terraform keeps its normal resource and attribute diff. SQL is a separate plan diagnostic, not a resource attribute or the basis of the diff. Capture `terraform plan -json -out=tfplan` (or `tofu plan`) to publish these diagnostics in a PR alongside `terraform show -no-color tfplan`. The JSON event stream contains each SQL report in `diagnostic.detail` when `diagnostic.summary` is `Reviewed SQL execution plan`; `terraform show` does not retain diagnostics. The computed `sql_plan_digest` binds the execution manifest to the saved plan.
 
-This mode supports `table`, `view`, `materialized_view`, `dictionary` and `table_contents`, including direct node fanout. Changes to other resource types fail planning; put them on a separate provider configuration. All provider and resource configuration values must be known during planning. For `table_contents`, apply schema changes first: the target table and columns used by the partition key must already exist when planning the data. Nondeterministic inputs or changes to schema/topology can require a fresh plan.
+This mode supports `table`, `view`, `materialized_view`, `dictionary` and `table_contents`, including resources that name a `node`. Changes to other resource types fail planning; put them on a separate provider configuration. All provider and resource configuration values must be known during planning. For `table_contents`, apply schema changes first: the target table and columns used by the partition key must already exist when planning the data. Nondeterministic inputs or changes to schema/topology can require a fresh plan.
 
 Dictionary sources and bound parameter values are redacted in the printout. Their full values are still checked at apply and stored in the saved plan; protect the plan artifact like Terraform state. Use the same provider version for planning and applying.
 

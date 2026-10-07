@@ -6,9 +6,9 @@ description: |-
   Use the clickhousedbops_view resource to manage ClickHouse views created with CREATE VIEW.
   The columns attribute is optional and can be shared from Terraform locals in the same way as table column definitions. ClickHouse stores an inferred column list for every view. When columns is not set, that list is not tracked.
   A change of query or columns is applied in place with CREATE OR REPLACE VIEW.
-  When the provider sets fanout_cluster, the resource acts on every node of that cluster and never uses ON CLUSTER:
-  Create and update make every node hold the configured definition. A missing view is created. A view that differs is replaced in place with CREATE OR REPLACE VIEW.Read queries every node. The nodes attribute lists the hosts that have the view. When a node is missing the view, or a node joins the cluster later, the plan shows an in-place update of nodes and the apply creates the view there. When one node holds a different definition, the plan shows that difference.Delete drops the view on every node with DROP ... IF EXISTS ... SYNC.cluster_name cannot be set together with fanout_cluster.
-  Creating a view that already exists on a node is an error, unless the provider sets adopt_existing = true. With adoption the existing view is changed in place to match the configuration, or left alone when it already matches.
+  Set node to manage the view on one server: the provider connects to node.host with its own protocol, credentials and TLS settings, and runs the DDL there without ON CLUSTER. To put the view on several servers, declare one resource per server, for example with for_each over your node list. Without node, the view lives on the provider's host.
+  node.name identifies the server: changing it replaces the view. node.host is only its address: changing it reconnects without a replacement.Import with database.name@<node name>@<host>[:<port>] so that the imported state names the node.
+  Creating a view that already exists is an error, unless the provider sets adopt_existing = true. With adoption the existing view is changed in place to match the configuration, or left alone when it already matches.
   SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in SHOW CREATE, because ClickHouse rewrites expressions into its canonical form.
 ---
 
@@ -20,14 +20,12 @@ The `columns` attribute is optional and can be shared from Terraform locals in t
 
 A change of `query` or `columns` is applied in place with `CREATE OR REPLACE VIEW`.
 
-When the provider sets `fanout_cluster`, the resource acts on every node of that cluster and never uses `ON CLUSTER`:
+Set `node` to manage the view on one server: the provider connects to `node.host` with its own protocol, credentials and TLS settings, and runs the DDL there without `ON CLUSTER`. To put the view on several servers, declare one resource per server, for example with `for_each` over your node list. Without `node`, the view lives on the provider's host.
 
-- Create and update make every node hold the configured definition. A missing view is created. A view that differs is replaced in place with `CREATE OR REPLACE VIEW`.
-- Read queries every node. The `nodes` attribute lists the hosts that have the view. When a node is missing the view, or a node joins the cluster later, the plan shows an in-place update of `nodes` and the apply creates the view there. When one node holds a different definition, the plan shows that difference.
-- Delete drops the view on every node with `DROP ... IF EXISTS ... SYNC`.
-- `cluster_name` cannot be set together with `fanout_cluster`.
+- `node.name` identifies the server: changing it replaces the view. `node.host` is only its address: changing it reconnects without a replacement.
+- Import with `database.name@<node name>@<host>[:<port>]` so that the imported state names the node.
 
-Creating a view that already exists on a node is an error, unless the provider sets `adopt_existing = true`. With adoption the existing view is changed in place to match the configuration, or left alone when it already matches.
+Creating a view that already exists is an error, unless the provider sets `adopt_existing = true`. With adoption the existing view is changed in place to match the configuration, or left alone when it already matches.
 
 SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in `SHOW CREATE`, because ClickHouse rewrites expressions into its canonical form.
 
@@ -64,14 +62,14 @@ resource "clickhousedbops_view" "team_event_counts" {
 
 ### Optional
 
-- `cluster_name` (String) Name of the cluster to create the view into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.
+- `cluster_name` (String) Name of the cluster to create the view into with ON CLUSTER. If omitted, the DDL runs only on the node.
 - `columns` (Attributes List) Optional view signature. Only name, type, and nullable are included in the CREATE VIEW signature. When omitted, the column list that ClickHouse infers is not tracked. (see [below for nested schema](#nestedatt--columns))
+- `node` (Attributes) The ClickHouse server the view lives on. If omitted, the view lives on the provider's host. The connection uses the provider's protocol, credentials and TLS settings. (see [below for nested schema](#nestedatt--node))
 
 ### Read-Only
 
 - `create_statement` (String) The CREATE VIEW statement as returned by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.view or database.view
-- `nodes` (List of String) Hosts where the view exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified name in the form database.view
 - `sql_plan_digest` (String) Digest of the reviewed SQL operations. When enforce_sql_plan is enabled, an apply cannot expand a known SQL plan.
 
@@ -86,3 +84,16 @@ Required:
 Optional:
 
 - `nullable` (Boolean) Whether the provider should wrap the column type in Nullable(...). Defaults to false.
+
+
+<a id="nestedatt--node"></a>
+### Nested Schema for `node`
+
+Required:
+
+- `host` (String) Address to connect to. Changing it reconnects without replacing the object.
+- `name` (String) Stable name of the server. A different name is a different server, so changing it replaces the object.
+
+Optional:
+
+- `port` (Number) Port to connect to. Defaults to the provider's port.

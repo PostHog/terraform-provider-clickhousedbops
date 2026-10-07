@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -16,18 +15,18 @@ import (
 
 type tableNodeClient struct {
 	dbops.Client
-	nodes      []dbops.SchemaNode
-	table      *dbops.Table
-	replicated []*tableNodeClient
-	alters     int
-	rows       uint64
+	table  *dbops.Table
+	alters [][]string
+	waits  int
+	rows   uint64
 }
 
-func (c *tableNodeClient) SchemaNodes(context.Context) ([]dbops.SchemaNode, error) {
-	return c.nodes, nil
-}
-func (c *tableNodeClient) FanoutCluster() string   { return "example" }
 func (c *tableNodeClient) IgnoreColumnOrder() bool { return true }
+func (c *tableNodeClient) Host() string            { return "node" }
+func (c *tableNodeClient) WaitForReplicaMetadata(context.Context, string, string) error {
+	c.waits++
+	return nil
+}
 func (c *tableNodeClient) GetTable(context.Context, string, string, *string) (*dbops.Table, error) {
 	copy := *c.table
 	return &copy, nil
@@ -42,12 +41,10 @@ func (c *tableNodeClient) GetTableSettingCapabilities(context.Context, string, [
 }
 
 func (c *tableNodeClient) AlterTable(_ context.Context, _ string, _ string, _ *string, actions []string) ([]dbops.RunningMutation, error) {
-	c.alters++
+	c.alters = append(c.alters, actions)
 	for _, action := range actions {
 		if strings.HasPrefix(action, "ADD COLUMN") {
-			for _, replica := range c.replicated {
-				replica.table.Columns = append(replica.table.Columns, dbops.Column{Name: "added", Type: "UInt64"})
-			}
+			c.table.Columns = append(c.table.Columns, dbops.Column{Name: "added", Type: "UInt64"})
 		}
 	}
 	return nil, nil
@@ -62,11 +59,8 @@ func plannedTable(t *testing.T, r *Resource, engine string) (TableResourceModel,
 	if diags.HasError() {
 		t.Fatal(diags)
 	}
-	nodes, diags := types.ListValueFrom(ctx, types.StringType, []string{"node1", "node2", "node3"})
-	if diags.HasError() {
-		t.Fatal(diags)
-	}
-	m := TableResourceModel{Database: types.StringValue("example"), Name: types.StringValue("t"), Engine: types.StringValue(engine), Columns: columns, OrderBy: types.StringValue("id"), Nodes: nodes, CreateStatement: types.StringValue("CREATE TABLE example.t"), ForceDestroy: types.BoolValue(true)}
+	node := types.ObjectNull(sr.Schema.Attributes["node"].GetType().(types.ObjectType).AttrTypes)
+	m := TableResourceModel{Database: types.StringValue("example"), Name: types.StringValue("t"), Engine: types.StringValue(engine), Columns: columns, OrderBy: types.StringValue("id"), Node: node, CreateStatement: types.StringValue("CREATE TABLE example.t"), ForceDestroy: types.BoolValue(true)}
 	for name, target := range map[string]*types.List{"indexes": &m.Indexes, "projections": &m.Projections, "constraints": &m.Constraints, "unmanaged_columns": &m.UnmanagedColumns, "unmanaged_indexes": &m.UnmanagedIndexes} {
 		listType := sr.Schema.Attributes[name].GetType().(types.ListType)
 		*target = types.ListNull(listType.ElemType)
@@ -78,16 +72,14 @@ func plannedTable(t *testing.T, r *Resource, engine string) (TableResourceModel,
 	return m, state
 }
 
-func TestPlanAggregatesNodeDriftAndReplacement(t *testing.T) {
+func TestPlanShowsDriftAndReplacement(t *testing.T) {
 	for _, immutable := range []bool{false, true} {
-		first := &tableNodeClient{table: &dbops.Table{Engine: "MergeTree()", Columns: []dbops.Column{{Name: "id", Type: "UInt64"}, {Name: "added", Type: "UInt64"}}, OrderBy: "id"}}
-		second := &tableNodeClient{table: &dbops.Table{Engine: "MergeTree()", Columns: []dbops.Column{{Name: "id", Type: "UInt64"}}, OrderBy: "id"}}
-		third := &tableNodeClient{table: &dbops.Table{Engine: "MergeTree()", Columns: first.table.Columns, OrderBy: "id"}}
+		node := &tableNodeClient{table: &dbops.Table{Engine: "MergeTree()", Columns: []dbops.Column{{Name: "id", Type: "UInt64"}}, OrderBy: "id"}}
 		if immutable {
-			third.table.PartitionBy = "id"
+			node.table.Columns = append(node.table.Columns, dbops.Column{Name: "added", Type: "UInt64"})
+			node.table.PartitionBy = "id"
 		}
-		client := &tableNodeClient{nodes: []dbops.SchemaNode{{Host: "node1", Client: first}, {Host: "node2", Client: second}, {Host: "node3", Client: third}}}
-		r := &Resource{client: client}
+		r := &Resource{client: node}
 		_, state := plannedTable(t, r, "MergeTree()")
 		plan := tfsdk.Plan(state)
 		resp := resource.ModifyPlanResponse{Plan: plan}
@@ -96,16 +88,7 @@ func TestPlanAggregatesNodeDriftAndReplacement(t *testing.T) {
 			t.Fatal(resp.Diagnostics)
 		}
 		if resp.Plan.Raw.Equal(state.Raw) {
-			t.Fatal("node drift was hidden by the matching first node")
-		}
-		if immutable {
-			marker := false
-			for _, p := range resp.RequiresReplace {
-				marker = marker || p.Equal(path.Root("create_statement"))
-			}
-			if !marker {
-				t.Fatal("replacement has no changing attribute path")
-			}
+			t.Fatal("the node's drift does not show in the plan")
 		}
 		if immutable != (len(resp.RequiresReplace) > 0) {
 			t.Fatalf("immutable=%v requires_replace=%v", immutable, resp.RequiresReplace)
@@ -113,21 +96,40 @@ func TestPlanAggregatesNodeDriftAndReplacement(t *testing.T) {
 	}
 }
 
-func TestReplicatedAlterRereadsAcrossTopologyShards(t *testing.T) {
+func TestReplicaRoles(t *testing.T) {
 	engine := "ReplicatedMergeTree('/tables/t', '{replica}')"
-	first := &tableNodeClient{table: &dbops.Table{Engine: engine, Columns: []dbops.Column{{Name: "id", Type: "UInt64"}}, OrderBy: "id"}}
-	second := &tableNodeClient{table: &dbops.Table{Engine: engine, Columns: []dbops.Column{{Name: "id", Type: "UInt64"}}, OrderBy: "id"}}
-	first.replicated = []*tableNodeClient{first, second}
-	second.replicated = first.replicated
-	client := &tableNodeClient{nodes: []dbops.SchemaNode{{Host: "node1", ShardNum: 1, Client: first}, {Host: "node2", ShardNum: 2, Client: second}}}
-	r := &Resource{client: client}
-	plan, _ := plannedTable(t, r, engine)
-	_, diags := r.convergeTable(context.Background(), plan, true, false, false)
-	if diags.HasError() {
-		t.Fatal(diags)
-	}
-	if first.alters != 1 || second.alters != 0 {
-		t.Fatalf("shared Keeper metadata was altered twice: %d,%d", first.alters, second.alters)
+	for _, tc := range []struct {
+		name        string
+		role        string
+		hasColumn   bool
+		wantAlters  int
+		wantWaits   int
+		wantFailure bool
+	}{
+		{name: "leader runs the replicated ALTER", role: replicaRoleLeader, wantAlters: 1},
+		{name: "no role runs it as a leader does", wantAlters: 1},
+		{name: "follower after its leader runs nothing", role: replicaRoleFollower, hasColumn: true, wantWaits: 2},
+		{name: "follower before its leader fails without altering", role: replicaRoleFollower, wantWaits: 1, wantFailure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &tableNodeClient{table: &dbops.Table{Engine: engine, Columns: []dbops.Column{{Name: "id", Type: "UInt64"}}, OrderBy: "id"}}
+			if tc.hasColumn {
+				node.table.Columns = append(node.table.Columns, dbops.Column{Name: "added", Type: "UInt64"})
+			}
+			r := &Resource{client: node}
+			plan, _ := plannedTable(t, r, engine)
+			plan.ReplicaRole = types.StringNull()
+			if tc.role != "" {
+				plan.ReplicaRole = types.StringValue(tc.role)
+			}
+			_, diags := r.convergeTable(context.Background(), plan, true, false, false)
+			if diags.HasError() != tc.wantFailure {
+				t.Fatalf("failure=%v, want %v: %v", diags.HasError(), tc.wantFailure, diags)
+			}
+			if len(node.alters) != tc.wantAlters || node.waits != tc.wantWaits {
+				t.Fatalf("alters=%d waits=%d, want %d and %d", len(node.alters), node.waits, tc.wantAlters, tc.wantWaits)
+			}
+		})
 	}
 }
 
@@ -137,9 +139,9 @@ func (c *tableNodeClient) TableRows(context.Context, string, string) (uint64, er
 
 func TestDataLossGuardChecksRemoteEngines(t *testing.T) {
 	node := &tableNodeClient{table: &dbops.Table{Engine: "MergeTree()"}, rows: 1}
-	r := &Resource{client: &tableNodeClient{nodes: []dbops.SchemaNode{{Host: "node", Client: node}}}}
+	r := &Resource{client: node}
 	state := TableResourceModel{Database: types.StringValue("example"), Name: types.StringValue("t"), Engine: types.StringValue("Memory()")}
 	if diags := r.guardDataLoss(context.Background(), state, "replace"); !diags.HasError() {
-		t.Fatal("a non-MergeTree state hid rows on another node")
+		t.Fatal("a non-MergeTree state hid the rows of the node's MergeTree table")
 	}
 }

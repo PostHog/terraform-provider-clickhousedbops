@@ -187,14 +187,13 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
-	var clusterName types.String
-	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("cluster_name"), &clusterName)...)
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-
-	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, clusterName, &resp.Plan)...)
-	if resp.Diagnostics.HasError() || req.State.Raw.IsNull() {
+	r = &Resource{client: client}
+	if req.State.Raw.IsNull() {
 		return
 	}
 
@@ -204,9 +203,9 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	_, converged, diags := schemahelpers.PlanNodeStates(ctx, r.client, plan,
-		func(ctx context.Context, client dbops.Client) (*dbops.Dictionary, error) {
-			return client.GetDictionary(ctx, plan.Database.ValueString(), plan.Name.ValueString(), plan.ClusterName.ValueStringPointer())
+	_, converged, diags := schemahelpers.PlanObject(ctx, plan,
+		func(ctx context.Context) (*dbops.Dictionary, error) {
+			return r.client.GetDictionary(ctx, plan.Database.ValueString(), plan.Name.ValueString(), plan.ClusterName.ValueStringPointer())
 		}, func(ctx context.Context, state *DictionaryResourceModel, dict *dbops.Dictionary) diag.Diagnostics {
 			return syncDictionaryState(ctx, state, dict, r.sourceComparison())
 		})
@@ -231,7 +230,7 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	}
 	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("attributes"), state.Attributes)...)
 	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("primary_key"), state.PrimaryKey)...)
-	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.Nodes, state.CreateStatement, []schemahelpers.EquivalentString{
+	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.CreateStatement, []schemahelpers.EquivalentString{
 		{Attribute: "source", Planned: plan.Source, State: state.Source, Equal: r.sourceComparison()},
 		{Attribute: "layout", Planned: plan.Layout, State: state.Layout},
 		{Attribute: "lifetime", Planned: plan.Lifetime, State: state.Lifetime},
@@ -241,6 +240,12 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 }
 
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan DictionaryResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -257,15 +262,21 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 }
 
 func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var state DictionaryResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	newState, dictionary, nodes, diags := schemahelpers.ReadNodes(ctx, r.client, state,
-		func(ctx context.Context, client dbops.Client) (*dbops.Dictionary, error) {
-			return client.GetDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	newState, dictionary, diags := schemahelpers.ReadObject(ctx, state,
+		func(ctx context.Context) (*dbops.Dictionary, error) {
+			return r.client.GetDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
 		},
 		func(ctx context.Context, state *DictionaryResourceModel, dict *dbops.Dictionary) diag.Diagnostics {
 			return syncDictionaryState(ctx, state, dict, r.sourceComparison())
@@ -280,12 +291,17 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	newState.Nodes = nodes
 	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, dictionary.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
 	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan DictionaryResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -302,22 +318,28 @@ func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp 
 }
 
 func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var state DictionaryResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
-		return client.DeleteDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
-	})...)
+	if err := r.client.DeleteDictionary(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer()); err != nil {
+		resp.Diagnostics.AddError("Error deleting object", fmt.Sprintf("%+v\n", err))
+	}
 }
 
 func (r *Resource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	schemahelpers.ImportSchemaObjectState(ctx, req, resp)
 }
 
-// convergeDictionary makes every node hold the planned dictionary. A dictionary that
+// convergeDictionary makes the node hold the planned dictionary. A dictionary that
 // differs is replaced in place with CREATE OR REPLACE DICTIONARY.
 func (r *Resource) convergeDictionary(ctx context.Context, plan DictionaryResourceModel, adopt bool) (*DictionaryResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
@@ -329,17 +351,17 @@ func (r *Resource) convergeDictionary(ctx context.Context, plan DictionaryResour
 	}
 
 	clusterName := plan.ClusterName.ValueStringPointer()
-	dictionary, nodes, convergeDiags := schemahelpers.ConvergeNodes(ctx, r.client, adopt, schemahelpers.NodeConverger[dbops.Dictionary]{
+	dictionary, convergeDiags := schemahelpers.Converge(ctx, adopt, schemahelpers.Converger[dbops.Dictionary]{
 		Kind:          "dictionary",
 		QualifiedName: schemahelpers.QualifiedName(desired.Database, desired.Name),
-		Get: func(ctx context.Context, client dbops.Client) (*dbops.Dictionary, error) {
-			return client.GetDictionary(ctx, desired.Database, desired.Name, clusterName)
+		Get: func(ctx context.Context) (*dbops.Dictionary, error) {
+			return r.client.GetDictionary(ctx, desired.Database, desired.Name, clusterName)
 		},
-		Create: func(ctx context.Context, client dbops.Client, _ *dbops.Dictionary) error {
-			_, err := client.CreateDictionary(ctx, desired, clusterName)
+		Create: func(ctx context.Context) error {
+			_, err := r.client.CreateDictionary(ctx, desired, clusterName)
 			return err
 		},
-		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.Dictionary) error {
+		Reconcile: func(ctx context.Context, existing *dbops.Dictionary) error {
 			candidate := plan
 			if syncDiags := syncDictionaryState(ctx, &candidate, existing, r.sourceComparison()); syncDiags.HasError() {
 				return schemahelpers.DiagnosticsError(syncDiags)
@@ -347,7 +369,7 @@ func (r *Resource) convergeDictionary(ctx context.Context, plan DictionaryResour
 			if reflect.DeepEqual(candidate, plan) {
 				return nil
 			}
-			_, err := node.Client.ReplaceDictionary(ctx, desired, clusterName)
+			_, err := r.client.ReplaceDictionary(ctx, desired, clusterName)
 			return err
 		},
 	})
@@ -357,7 +379,6 @@ func (r *Resource) convergeDictionary(ctx context.Context, plan DictionaryResour
 	}
 
 	state := plan
-	state.Nodes = nodes
 	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, dictionary.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
 
 	return &state, diags

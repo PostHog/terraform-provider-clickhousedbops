@@ -459,7 +459,7 @@ func CommonSchemaAttributes(objectType string) map[string]schema.Attribute {
 		"sql_plan_digest": schema.StringAttribute{Computed: true, Description: "Digest of the reviewed SQL operations. When enforce_sql_plan is enabled, an apply cannot expand a known SQL plan."},
 		"cluster_name": schema.StringAttribute{
 			Optional:    true,
-			Description: fmt.Sprintf("Name of the cluster to create the %s into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.", objectType),
+			Description: fmt.Sprintf("Name of the cluster to create the %s into with ON CLUSTER. If omitted, the DDL runs only on the node.", objectType),
 			PlanModifiers: []planmodifier.String{
 				stringplanmodifier.RequiresReplace(),
 			},
@@ -478,11 +478,7 @@ func CommonSchemaAttributes(objectType string) map[string]schema.Attribute {
 				stringplanmodifier.UseStateForUnknown(),
 			},
 		},
-		"nodes": schema.ListAttribute{
-			Computed:    true,
-			ElementType: types.StringType,
-			Description: fmt.Sprintf("Hosts where the %s exists: every node of the provider's fanout_cluster, or the provider host.", objectType),
-		},
+		"node": NodeAttribute(objectType),
 		"create_statement": schema.StringAttribute{
 			Computed:    true,
 			Description: fmt.Sprintf("The CREATE %s statement as returned by ClickHouse", strings.ToUpper(objectType)),
@@ -515,6 +511,15 @@ func CommonSchemaAttributes(objectType string) map[string]schema.Attribute {
 // database, name, and optionally cluster_name attributes on the state.
 func ImportSchemaObjectState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	ref := req.ID
+	var node *NodeModel
+	if objectRef, nodeRef, found := strings.Cut(ref, "@"); found {
+		var err error
+		if node, err = importNode(nodeRef); err != nil {
+			resp.Diagnostics.AddError("Invalid import ID", fmt.Sprintf("Expected format: [cluster:]database.name[@node@host[:port]], got %s: %v", req.ID, err))
+			return
+		}
+		ref = objectRef
+	}
 	var clusterName *string
 	if strings.Contains(ref, ":") {
 		parts := strings.SplitN(ref, ":", 2)
@@ -526,7 +531,7 @@ func ImportSchemaObjectState(ctx context.Context, req resource.ImportStateReques
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		resp.Diagnostics.AddError(
 			"Invalid import ID",
-			fmt.Sprintf("Expected format: [cluster:]database.name, got: %s", req.ID),
+			fmt.Sprintf("Expected format: [cluster:]database.name[@node@host[:port]], got: %s", req.ID),
 		)
 		return
 	}
@@ -535,6 +540,11 @@ func ImportSchemaObjectState(ctx context.Context, req resource.ImportStateReques
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), parts[1])...)
 	if clusterName != nil {
 		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("cluster_name"), *clusterName)...)
+	}
+	if node != nil {
+		value, diags := nodeValue(ctx, node)
+		resp.Diagnostics.Append(diags...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("node"), value)...)
 	}
 }
 
