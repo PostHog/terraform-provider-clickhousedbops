@@ -52,6 +52,24 @@ func decodeSQLPlan(data []byte) (savedSQLPlan, bool) {
 }
 
 func setSQLPlanDigest(value *tfprotov6.DynamicValue, typ tftypes.Type, digest string) (*tfprotov6.DynamicValue, error) {
+	return setSQLPlanDigestValue(value, typ, tftypes.NewValue(tftypes.String, digest))
+}
+
+// keepPriorSQLPlanDigest plans the digest that the prior state holds. An imported object has a
+// null digest; planning "" for it would show a change that runs no SQL.
+func keepPriorSQLPlanDigest(value *tfprotov6.DynamicValue, typ tftypes.Type, prior tftypes.Value, digest string) (*tfprotov6.DynamicValue, error) {
+	if !prior.IsNull() {
+		var attributes map[string]tftypes.Value
+		if err := prior.As(&attributes); err == nil {
+			if attribute, ok := attributes["sql_plan_digest"]; ok && attribute.IsKnown() && attribute.IsNull() {
+				return setSQLPlanDigestValue(value, typ, tftypes.NewValue(tftypes.String, nil))
+			}
+		}
+	}
+	return setSQLPlanDigest(value, typ, digest)
+}
+
+func setSQLPlanDigestValue(value *tfprotov6.DynamicValue, typ tftypes.Type, digest tftypes.Value) (*tfprotov6.DynamicValue, error) {
 	raw, err := value.Unmarshal(typ)
 	if err != nil || raw.IsNull() {
 		return value, err
@@ -60,7 +78,7 @@ func setSQLPlanDigest(value *tfprotov6.DynamicValue, typ tftypes.Type, digest st
 	if err := raw.As(&attributes); err != nil {
 		return nil, err
 	}
-	attributes["sql_plan_digest"] = tftypes.NewValue(tftypes.String, digest)
+	attributes["sql_plan_digest"] = digest
 	result, err := tfprotov6.NewDynamicValue(typ, tftypes.NewValue(typ, attributes))
 	return &result, err
 }
@@ -137,7 +155,7 @@ func (s *sqlPlanServer) PlanResourceChange(ctx context.Context, req *tfprotov6.P
 		return resp, nil
 	}
 	if !s.provider.enforceSQLPlan {
-		resp.PlannedState, err = setSQLPlanDigest(resp.PlannedState, typ, digest)
+		resp.PlannedState, err = keepPriorSQLPlanDigest(resp.PlannedState, typ, prior, digest)
 		if err != nil {
 			resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
 		}
@@ -183,7 +201,7 @@ func (s *sqlPlanServer) PlanResourceChange(ctx context.Context, req *tfprotov6.P
 		recording.Operations = nil
 		preview.PriorState = &null
 	}
-	candidate, err := setSQLPlanDigest(resp.PlannedState, typ, digest)
+	candidate, err := keepPriorSQLPlanDigest(resp.PlannedState, typ, prior, digest)
 	if err != nil {
 		resp.Diagnostics = append(resp.Diagnostics, sqlDiagnostic(err))
 		return resp, nil
