@@ -14,9 +14,9 @@ description: |-
   ClickHouse refuses to drop a table that a dictionary or view reads from, so replacing such a table fails. With ignore_drop_dependencies = true, a change that cannot be altered in place recreates the table within the update instead: it drops the table with check_table_dependencies = 0 and creates it again, and the plan shows an in-place update with a warning. The configured value counts, so this works in the same apply that imports or adopts the table. On this path force_destroy also counts from the configuration: a table that holds rows is recreated only when the configuration sets it. An existing Replicated* table can be recreated as a local table, because its drop releases the replica in Keeper; recreating it as a Replicated* table again is refused, because its replicas cannot be recreated one node at a time.
   A mutation that keeps failing on the table fails every plan of it, with the KILL MUTATION statement that stops it. Its ALTER already changed the metadata, so without this the table would look up to date while its data is not.
   unmanaged_columns and unmanaged_indexes are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.
-  When the provider sets fanout_cluster, the resource acts on every node of that cluster and never uses ON CLUSTER:
-  Create and update make every node hold the configured definition. A missing table is created. An existing table is altered in place from its current definition on that node; when the difference needs a replacement, the apply fails with an error that names the node and the attributes. For a Replicated* engine the ALTER runs on the first replica of each shard that has the table, because ClickHouse replicates it; only MODIFY SETTING and RESET SETTING run on every replica, because ClickHouse does not replicate them. A new replica of an existing shard is created with the column and index list that the shard already holds.Read queries every node. The nodes attribute lists the hosts that have the table. When a node is missing the table, or a node joins the cluster later, the plan shows an in-place update of nodes and the apply creates the table there. When one node holds a different definition, the plan shows that difference.Delete drops the table on every node with DROP ... IF EXISTS ... SYNC.cluster_name cannot be set together with fanout_cluster.
-  Creating a table that already exists on a node is an error, unless the provider sets adopt_existing = true. With adoption the existing table is changed in place to match the configuration, or left alone when it already matches.
+  Set node to manage the table on one server: the provider connects to node.host with its own protocol, credentials and TLS settings, and runs the DDL there without ON CLUSTER. To put the table on several servers, declare one resource per server, for example with for_each over your node list. Without node, the table lives on the provider's host.
+  node.name identifies the server: changing it replaces the table. node.host is only its address: changing it reconnects without a replacement.Import with database.name@<node name>@<host>[:<port>] so that the imported state names the node.On a Replicated* table, set replica_role on each replica of a shard. The leader runs the ALTERs that ClickHouse replicates through Keeper; each follower waits until that metadata has arrived and then runs only MODIFY SETTING and RESET SETTING, which ClickHouse does not replicate. A follower that still differs fails instead of altering. Apply followers after their leader, for example with depends_on.
+  Creating a table that already exists is an error, unless the provider sets adopt_existing = true. With adoption the existing table is changed in place to match the configuration, or left alone when it already matches.
   SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in SHOW CREATE, because ClickHouse rewrites expressions into its canonical form.
 ---
 
@@ -47,14 +47,13 @@ A mutation that keeps failing on the table fails every plan of it, with the `KIL
 
 `unmanaged_columns` and `unmanaged_indexes` are lists of RE2 regular expressions. A remote column or index whose name matches a pattern and that the configuration does not declare is invisible to the provider: it is not reported, changed, or dropped.
 
-When the provider sets `fanout_cluster`, the resource acts on every node of that cluster and never uses `ON CLUSTER`:
+Set `node` to manage the table on one server: the provider connects to `node.host` with its own protocol, credentials and TLS settings, and runs the DDL there without `ON CLUSTER`. To put the table on several servers, declare one resource per server, for example with `for_each` over your node list. Without `node`, the table lives on the provider's host.
 
-- Create and update make every node hold the configured definition. A missing table is created. An existing table is altered in place from its current definition on that node; when the difference needs a replacement, the apply fails with an error that names the node and the attributes. For a `Replicated*` engine the `ALTER` runs on the first replica of each shard that has the table, because ClickHouse replicates it; only `MODIFY SETTING` and `RESET SETTING` run on every replica, because ClickHouse does not replicate them. A new replica of an existing shard is created with the column and index list that the shard already holds.
-- Read queries every node. The `nodes` attribute lists the hosts that have the table. When a node is missing the table, or a node joins the cluster later, the plan shows an in-place update of `nodes` and the apply creates the table there. When one node holds a different definition, the plan shows that difference.
-- Delete drops the table on every node with `DROP ... IF EXISTS ... SYNC`.
-- `cluster_name` cannot be set together with `fanout_cluster`.
+- `node.name` identifies the server: changing it replaces the table. `node.host` is only its address: changing it reconnects without a replacement.
+- Import with `database.name@<node name>@<host>[:<port>]` so that the imported state names the node.
+- On a `Replicated*` table, set `replica_role` on each replica of a shard. The `leader` runs the `ALTER`s that ClickHouse replicates through Keeper; each `follower` waits until that metadata has arrived and then runs only `MODIFY SETTING` and `RESET SETTING`, which ClickHouse does not replicate. A follower that still differs fails instead of altering. Apply followers after their leader, for example with `depends_on`.
 
-Creating a table that already exists on a node is an error, unless the provider sets `adopt_existing = true`. With adoption the existing table is changed in place to match the configuration, or left alone when it already matches.
+Creating a table that already exists is an error, unless the provider sets `adopt_existing = true`. With adoption the existing table is changed in place to match the configuration, or left alone when it already matches.
 
 SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in `SHOW CREATE`, because ClickHouse rewrites expressions into its canonical form.
 
@@ -100,16 +99,18 @@ resource "clickhousedbops_table" "events" {
 ### Optional
 
 - `as_select` (String) Optional raw query appended as AS <query> after the table definition
-- `cluster_name` (String) Name of the cluster to create the table into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.
+- `cluster_name` (String) Name of the cluster to create the table into with ON CLUSTER. If omitted, the DDL runs only on the node.
 - `columns` (Attributes List) Structured column definitions. This can be assigned directly from a local list of objects. (see [below for nested schema](#nestedatt--columns))
 - `constraints` (Attributes List) CHECK constraints. They are compared by name, not by position. (see [below for nested schema](#nestedatt--constraints))
 - `force_destroy` (Boolean) Allow dropping or replacing this table while a MergeTree-family engine holds rows on any node. The value in state counts, so set it to true and apply before the change that drops the table.
 - `ignore_drop_dependencies` (Boolean) Recreate the table in place when a change cannot be altered, instead of replacing it: the update drops it with check_table_dependencies = 0, which works while a dictionary or view reads from it, and creates it again. Dictionaries keep serving what they loaded until they reload. The configured value counts, also when the table is imported or adopted in the same apply, and so does force_destroy on this path. A Replicated table can be recreated as a local table, but not as a Replicated one.
 - `indexes` (Attributes List) Data skipping indexes. They are compared by name, not by position. (see [below for nested schema](#nestedatt--indexes))
+- `node` (Attributes) The ClickHouse server the table lives on. If omitted, the table lives on the provider's host. The connection uses the provider's protocol, credentials and TLS settings. (see [below for nested schema](#nestedatt--node))
 - `order_by` (String) Raw ORDER BY clause expression
 - `partition_by` (String) Raw PARTITION BY clause expression
 - `primary_key` (String) Raw PRIMARY KEY clause expression
 - `projections` (Attributes List) Projections. They are compared by name, not by position. (see [below for nested schema](#nestedatt--projections))
+- `replica_role` (String) For one replica of a Replicated table: "leader" runs the ALTERs that reach every replica of the shard through Keeper; "follower" waits for those to arrive and changes only its own settings, and fails if its table still differs. Apply followers after their leader. If omitted, the node runs every ALTER, as a leader does.
 - `sample_by` (String) Raw SAMPLE BY clause expression
 - `settings` (String) Raw SETTINGS clause body
 - `ttl` (String) Raw TTL clause expression
@@ -120,7 +121,6 @@ resource "clickhousedbops_table" "events" {
 
 - `create_statement` (String) The CREATE TABLE statement as returned by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.table or database.table
-- `nodes` (List of String) Hosts where the table exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified name in the form database.table
 - `sql_plan_digest` (String) Digest of the reviewed SQL operations. When enforce_sql_plan is enabled, an apply cannot expand a known SQL plan.
 
@@ -165,6 +165,19 @@ Required:
 Optional:
 
 - `granularity` (Number) Index granularity. Defaults to 1.
+
+
+<a id="nestedatt--node"></a>
+### Nested Schema for `node`
+
+Required:
+
+- `host` (String) Address to connect to. Changing it reconnects without replacing the object.
+- `name` (String) Stable name of the server. A different name is a different server, so changing it replaces the object.
+
+Optional:
+
+- `port` (Number) Port to connect to. Defaults to the provider's port.
 
 
 <a id="nestedatt--projections"></a>

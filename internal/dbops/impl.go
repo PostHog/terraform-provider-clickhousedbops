@@ -19,10 +19,9 @@ type impl struct {
 	adoptExisting       bool
 	ignoreColumnOrder   bool
 	manageDictPasswords bool
-	fanoutCluster       string
 	nodeFactory         NodeClientFactory
 	nodesMu             sync.Mutex
-	nodes               []SchemaNode
+	nodes               map[string]Client
 }
 
 // ClientOption configures optional behaviour of the dbops client.
@@ -65,11 +64,9 @@ func WithManageDictionaryPasswords(manage bool) ClientOption {
 	}
 }
 
-// WithFanout makes schema objects apply to every node of the cluster. The factory opens a
-// direct connection to one node.
-func WithFanout(cluster string, factory NodeClientFactory) ClientOption {
+// WithNodeFactory lets schema resources connect to the node they name.
+func WithNodeFactory(factory NodeClientFactory) ClientOption {
 	return func(i *impl) {
-		i.fanoutCluster = cluster
 		i.nodeFactory = factory
 	}
 }

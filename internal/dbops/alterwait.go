@@ -34,7 +34,7 @@ var (
 // reached every replica's metadata. It returns the mutations the ALTER started that are still
 // running, and an error for one that failed.
 func (i *impl) waitForAlter(ctx context.Context, database string, name string, startedAt uint64) ([]RunningMutation, error) {
-	if err := i.waitForReplicaMetadata(ctx, database, name); err != nil {
+	if err := i.WaitForReplicaMetadata(ctx, database, name); err != nil {
 		return nil, err
 	}
 
@@ -64,9 +64,9 @@ func (i *impl) waitForAlter(ctx context.Context, database string, name string, s
 	}
 }
 
-// waitForReplicaMetadata waits until every replica of a Replicated table has applied the
+// WaitForReplicaMetadata waits until every replica of a Replicated table has applied the
 // table's latest metadata version from Keeper. Other tables return at once.
-func (i *impl) waitForReplicaMetadata(ctx context.Context, database string, name string) error {
+func (i *impl) WaitForReplicaMetadata(ctx context.Context, database string, name string) error {
 	zookeeperPath, err := i.ReplicationPath(ctx, database, name)
 	if err != nil || zookeeperPath == "" {
 		return err

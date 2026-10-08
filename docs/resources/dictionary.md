@@ -7,9 +7,9 @@ description: |-
   The attributes block is a list of objects so you can define a single local value and reuse it across dictionaries and the tables they read from. An attribute type can contain Nullable(...) verbatim, or you can set nullable = true: both forms are equal.
   A change of any attribute except database, name and cluster_name is applied in place with CREATE OR REPLACE DICTIONARY.
   ClickHouse reports PASSWORD '[HIDDEN]' in the SOURCE clause. The provider compares source with the password value masked and keeps the configured text in state, so a change of only the password is not detected.
-  When the provider sets fanout_cluster, the resource acts on every node of that cluster and never uses ON CLUSTER:
-  Create and update make every node hold the configured definition. A missing dictionary is created. A dictionary that differs is replaced in place with CREATE OR REPLACE DICTIONARY.Read queries every node. The nodes attribute lists the hosts that have the dictionary. When a node is missing the dictionary, or a node joins the cluster later, the plan shows an in-place update of nodes and the apply creates the dictionary there. When one node holds a different definition, the plan shows that difference.Delete drops the dictionary on every node with DROP ... IF EXISTS ... SYNC.cluster_name cannot be set together with fanout_cluster.
-  Creating a dictionary that already exists on a node is an error, unless the provider sets adopt_existing = true. With adoption the existing dictionary is changed in place to match the configuration, or left alone when it already matches.
+  Set node to manage the dictionary on one server: the provider connects to node.host with its own protocol, credentials and TLS settings, and runs the DDL there without ON CLUSTER. To put the dictionary on several servers, declare one resource per server, for example with for_each over your node list. Without node, the dictionary lives on the provider's host.
+  node.name identifies the server: changing it replaces the dictionary. node.host is only its address: changing it reconnects without a replacement.Import with database.name@<node name>@<host>[:<port>] so that the imported state names the node.
+  Creating a dictionary that already exists is an error, unless the provider sets adopt_existing = true. With adoption the existing dictionary is changed in place to match the configuration, or left alone when it already matches.
   SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in SHOW CREATE, because ClickHouse rewrites expressions into its canonical form.
 ---
 
@@ -23,14 +23,12 @@ A change of any attribute except `database`, `name` and `cluster_name` is applie
 
 ClickHouse reports `PASSWORD '[HIDDEN]'` in the `SOURCE` clause. The provider compares `source` with the password value masked and keeps the configured text in state, so a change of only the password is not detected.
 
-When the provider sets `fanout_cluster`, the resource acts on every node of that cluster and never uses `ON CLUSTER`:
+Set `node` to manage the dictionary on one server: the provider connects to `node.host` with its own protocol, credentials and TLS settings, and runs the DDL there without `ON CLUSTER`. To put the dictionary on several servers, declare one resource per server, for example with `for_each` over your node list. Without `node`, the dictionary lives on the provider's host.
 
-- Create and update make every node hold the configured definition. A missing dictionary is created. A dictionary that differs is replaced in place with `CREATE OR REPLACE DICTIONARY`.
-- Read queries every node. The `nodes` attribute lists the hosts that have the dictionary. When a node is missing the dictionary, or a node joins the cluster later, the plan shows an in-place update of `nodes` and the apply creates the dictionary there. When one node holds a different definition, the plan shows that difference.
-- Delete drops the dictionary on every node with `DROP ... IF EXISTS ... SYNC`.
-- `cluster_name` cannot be set together with `fanout_cluster`.
+- `node.name` identifies the server: changing it replaces the dictionary. `node.host` is only its address: changing it reconnects without a replacement.
+- Import with `database.name@<node name>@<host>[:<port>]` so that the imported state names the node.
 
-Creating a dictionary that already exists on a node is an error, unless the provider sets `adopt_existing = true`. With adoption the existing dictionary is changed in place to match the configuration, or left alone when it already matches.
+Creating a dictionary that already exists is an error, unless the provider sets `adopt_existing = true`. With adoption the existing dictionary is changed in place to match the configuration, or left alone when it already matches.
 
 SQL text is compared with ClickHouse ignoring whitespace and line breaks outside quotes, so an attribute can be written over several lines. Apart from that, write each attribute the way ClickHouse prints it in `SHOW CREATE`, because ClickHouse rewrites expressions into its canonical form.
 
@@ -82,8 +80,9 @@ resource "clickhousedbops_dictionary" "teams" {
 
 ### Optional
 
-- `cluster_name` (String) Name of the cluster to create the dictionary into with ON CLUSTER. If omitted, the DDL runs only on the connected replica. Cannot be set when the provider sets fanout_cluster.
+- `cluster_name` (String) Name of the cluster to create the dictionary into with ON CLUSTER. If omitted, the DDL runs only on the node.
 - `comment` (String) Comment associated with the dictionary
+- `node` (Attributes) The ClickHouse server the dictionary lives on. If omitted, the dictionary lives on the provider's host. The connection uses the provider's protocol, credentials and TLS settings. (see [below for nested schema](#nestedatt--node))
 - `range` (String) Raw RANGE clause body for range dictionaries, for example MIN start_date MAX end_date
 - `settings` (String) Raw SETTINGS clause body
 
@@ -91,7 +90,6 @@ resource "clickhousedbops_dictionary" "teams" {
 
 - `create_statement` (String, Sensitive) The CREATE DICTIONARY statement as returned by ClickHouse
 - `id` (String) Stable identifier in the form cluster:database.dictionary or database.dictionary
-- `nodes` (List of String) Hosts where the dictionary exists: every node of the provider's fanout_cluster, or the provider host.
 - `qualified_name` (String) Qualified name in the form database.dictionary
 - `sql_plan_digest` (String) Digest of the reviewed SQL operations. When enforce_sql_plan is enabled, an apply cannot expand a known SQL plan.
 
@@ -111,3 +109,16 @@ Optional:
 - `injective` (Boolean) Whether to append the INJECTIVE modifier
 - `is_object_id` (Boolean) Whether to append the IS_OBJECT_ID modifier
 - `nullable` (Boolean) Whether the provider should wrap the attribute type in Nullable(...). Defaults to false.
+
+
+<a id="nestedatt--node"></a>
+### Nested Schema for `node`
+
+Required:
+
+- `host` (String) Address to connect to. Changing it reconnects without replacing the object.
+- `name` (String) Stable name of the server. A different name is a different server, so changing it replaces the object.
+
+Optional:
+
+- `port` (Number) Port to connect to. Defaults to the provider's port.

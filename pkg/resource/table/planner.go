@@ -19,6 +19,10 @@ import (
 type plannedTableUpdate struct {
 	ReplaceAttrs map[string]struct{}
 	ActionGroups [][]string
+	// SettingGroups holds the groups of ActionGroups that change table settings. On a
+	// Replicated table they apply to one replica only; every other ALTER reaches all replicas
+	// through Keeper.
+	SettingGroups [][]string
 }
 
 type engineUpdateStrategy struct {
@@ -240,6 +244,7 @@ func planTableUpdate(current dbops.Table, desired dbops.Table, capabilities dbop
 		plan.ActionGroups = append(plan.ActionGroups, tableActions)
 	}
 	plan.ActionGroups = append(plan.ActionGroups, settingsActions...)
+	plan.SettingGroups = settingsActions
 	if len(columnPlan.dropActions) > 0 {
 		plan.ActionGroups = append(plan.ActionGroups, columnPlan.dropActions)
 	}

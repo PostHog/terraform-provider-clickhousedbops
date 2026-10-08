@@ -75,7 +75,7 @@ TF_ACC_TERRAFORM_PATH=/path/to/tofu \
 go test ./pkg/provider -run TestSQLPlanSavedFile -v -count=1
 ```
 
-Use a disposable ClickHouse instance with the `default` user and no password. Set `SQL_PLAN_TEST_SECOND_CLICKHOUSE_URL` to another disposable instance to exercise two-node fanout; a test proxy supplies the topology. Set `TF_ACC_TERRAFORM_PATH` to Terraform to run the same saved-plan checks with that CLI.
+Use a disposable ClickHouse instance with the `default` user and no password. Set `TF_ACC_TERRAFORM_PATH` to Terraform to run the same saved-plan checks with that CLI.
 
 The test checks that planning sends no writes, SQL appears in the printout, config edits cannot change a saved apply, schema drift fails before writing, and create/update/replacement/destroy and declared contents work. It also checks partition IDs against actual ClickHouse parts, including composite and empty partition keys.
 

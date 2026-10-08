@@ -256,18 +256,20 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		return
 	}
 
-	resp.Diagnostics.Append(schemahelpers.PlanNodes(ctx, r.client, plan.ClusterName, &resp.Plan)...)
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
 	if resp.Diagnostics.HasError() || req.State.Raw.IsNull() {
 		return
 	}
+	r = &Resource{client: client}
 
 	// MODIFY QUERY works only for a materialized view that writes to a separate table, and
-	// the provider runs it per node, not ON CLUSTER.
+	// the provider runs it on the node, not ON CLUSTER.
 	var state MaterializedViewResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	states, converged, diags := schemahelpers.PlanNodeStates(ctx, r.client, plan,
-		func(ctx context.Context, client dbops.Client) (*dbops.MaterializedView, error) {
-			return client.GetMaterializedView(ctx, plan.Database.ValueString(), plan.Name.ValueString(), plan.ClusterName.ValueStringPointer())
+	remote, converged, diags := schemahelpers.PlanObject(ctx, plan,
+		func(ctx context.Context) (*dbops.MaterializedView, error) {
+			return r.client.GetMaterializedView(ctx, plan.Database.ValueString(), plan.Name.ValueString(), plan.ClusterName.ValueStringPointer())
 		}, syncMaterializedViewState)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -277,8 +279,8 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 		state.CreateStatement = types.StringUnknown()
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("create_statement"), types.StringUnknown())...)
 	}
-	for _, remote := range states {
-		resp.RequiresReplace = append(resp.RequiresReplace, nodeReplacementPaths(plan, remote)...)
+	if remote != nil {
+		resp.RequiresReplace = append(resp.RequiresReplace, nodeReplacementPaths(plan, *remote)...)
 	}
 	if (plan.ToTable.IsNull() || !plan.ClusterName.IsNull()) && !schemahelpers.SQLEqual(plan.Query.ValueString(), state.Query.ValueString()) {
 		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("query"))
@@ -291,7 +293,7 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 	if resp.Diagnostics.HasError() || !plan.Columns.Equal(state.Columns) || !plan.ToColumns.Equal(state.ToColumns) || !plan.Populate.Equal(state.Populate) {
 		return
 	}
-	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.Nodes, state.CreateStatement, []schemahelpers.EquivalentString{
+	resp.Diagnostics.Append(schemahelpers.KeepEquivalentStrings(ctx, &resp.Plan, state.CreateStatement, []schemahelpers.EquivalentString{
 		{Attribute: "query", Planned: plan.Query, State: state.Query},
 		{Attribute: attributeToTable, Planned: plan.ToTable, State: state.ToTable},
 		{Attribute: attributeEngine, Planned: plan.Engine, State: state.Engine},
@@ -305,6 +307,12 @@ func (r *Resource) ModifyPlan(ctx context.Context, req resource.ModifyPlanReques
 }
 
 func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan MaterializedViewResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -321,15 +329,21 @@ func (r *Resource) Create(ctx context.Context, req resource.CreateRequest, resp 
 }
 
 func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var state MaterializedViewResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	newState, view, nodes, diags := schemahelpers.ReadNodes(ctx, r.client, state,
-		func(ctx context.Context, client dbops.Client) (*dbops.MaterializedView, error) {
-			return client.GetMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
+	newState, view, diags := schemahelpers.ReadObject(ctx, state,
+		func(ctx context.Context) (*dbops.MaterializedView, error) {
+			return r.client.GetMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
 		},
 		syncMaterializedViewState,
 	)
@@ -342,12 +356,17 @@ func (r *Resource) Read(ctx context.Context, req resource.ReadRequest, resp *res
 		return
 	}
 
-	newState.Nodes = nodes
 	schemahelpers.SyncObjectState(newState.ClusterName, newState.Database, newState.Name, view.CreateStatement, &newState.ID, &newState.QualifiedName, &newState.CreateStatement)
 	resp.Diagnostics.Append(resp.State.Set(ctx, newState)...)
 }
 
 func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.Plan.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var plan MaterializedViewResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
@@ -364,18 +383,24 @@ func (r *Resource) Update(ctx context.Context, req resource.UpdateRequest, resp 
 }
 
 func (r *Resource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	client, nodeDiags := schemahelpers.NodeClient(ctx, r.client, req.State.GetAttribute)
+	resp.Diagnostics.Append(nodeDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r = &Resource{client: client}
 	var state MaterializedViewResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	resp.Diagnostics.Append(schemahelpers.DeleteNodes(ctx, r.client, func(ctx context.Context, client dbops.Client) error {
-		return client.DeleteMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer())
-	})...)
+	if err := r.client.DeleteMaterializedView(ctx, state.Database.ValueString(), state.Name.ValueString(), state.ClusterName.ValueStringPointer()); err != nil {
+		resp.Diagnostics.AddError("Error deleting object", fmt.Sprintf("%+v\n", err))
+	}
 }
 
-// convergeMaterializedView makes every node hold the planned materialized view. Only the
+// convergeMaterializedView makes the node hold the planned materialized view. Only the
 // query of a TO-table materialized view can change in place.
 func (r *Resource) convergeMaterializedView(ctx context.Context, plan MaterializedViewResourceModel, adopt bool) (*MaterializedViewResourceModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
@@ -387,17 +412,17 @@ func (r *Resource) convergeMaterializedView(ctx context.Context, plan Materializ
 	}
 
 	clusterName := plan.ClusterName.ValueStringPointer()
-	view, nodes, convergeDiags := schemahelpers.ConvergeNodes(ctx, r.client, adopt, schemahelpers.NodeConverger[dbops.MaterializedView]{
+	view, convergeDiags := schemahelpers.Converge(ctx, adopt, schemahelpers.Converger[dbops.MaterializedView]{
 		Kind:          "materialized view",
 		QualifiedName: schemahelpers.QualifiedName(desired.Database, desired.Name),
-		Get: func(ctx context.Context, client dbops.Client) (*dbops.MaterializedView, error) {
-			return client.GetMaterializedView(ctx, desired.Database, desired.Name, clusterName)
+		Get: func(ctx context.Context) (*dbops.MaterializedView, error) {
+			return r.client.GetMaterializedView(ctx, desired.Database, desired.Name, clusterName)
 		},
-		Create: func(ctx context.Context, client dbops.Client, _ *dbops.MaterializedView) error {
-			_, err := client.CreateMaterializedView(ctx, desired, clusterName)
+		Create: func(ctx context.Context) error {
+			_, err := r.client.CreateMaterializedView(ctx, desired, clusterName)
 			return err
 		},
-		Reconcile: func(ctx context.Context, node dbops.SchemaNode, _ bool, existing *dbops.MaterializedView) error {
+		Reconcile: func(ctx context.Context, existing *dbops.MaterializedView) error {
 			candidate := plan
 			if syncDiags := syncMaterializedViewState(ctx, &candidate, existing); syncDiags.HasError() {
 				return schemahelpers.DiagnosticsError(syncDiags)
@@ -433,9 +458,9 @@ func (r *Resource) convergeMaterializedView(ctx context.Context, plan Materializ
 				return nil
 			}
 			if clusterName != nil {
-				return errors.New("the query of a materialized view cannot be changed in place with cluster_name; use the provider fanout_cluster instead")
+				return errors.New("the query of a materialized view cannot be changed in place with cluster_name; declare one resource per node instead")
 			}
-			return node.Client.ModifyMaterializedViewQuery(ctx, desired.Database, desired.Name, desired.Query)
+			return r.client.ModifyMaterializedViewQuery(ctx, desired.Database, desired.Name, desired.Query)
 		},
 	})
 	diags.Append(convergeDiags...)
@@ -444,7 +469,6 @@ func (r *Resource) convergeMaterializedView(ctx context.Context, plan Materializ
 	}
 
 	state := plan
-	state.Nodes = nodes
 	schemahelpers.SyncObjectState(state.ClusterName, state.Database, state.Name, view.CreateStatement, &state.ID, &state.QualifiedName, &state.CreateStatement)
 
 	return &state, diags

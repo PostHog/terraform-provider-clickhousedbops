@@ -27,6 +27,7 @@ type Client interface {
 	ReplaceTableContents(ctx context.Context, database string, table string, format string, data string) error
 	IsReplicated(ctx context.Context, database string, table string) (bool, error)
 	ReplicationPath(ctx context.Context, database string, table string) (string, error)
+	WaitForReplicaMetadata(ctx context.Context, database string, name string) error
 	AlterTable(ctx context.Context, database string, name string, clusterName *string, actions []string) ([]RunningMutation, error)
 	GetTableEngineCapabilities(ctx context.Context, engine string) (TableEngineCapabilities, error)
 	GetTableSettingCapabilities(ctx context.Context, engine string, settingNames []string) (map[string]TableSettingCapability, error)
@@ -41,10 +42,10 @@ type Client interface {
 	ModifyMaterializedViewQuery(ctx context.Context, database string, name string, query string) error
 	DeleteMaterializedView(ctx context.Context, database string, name string, clusterName *string) error
 
-	// SchemaNodes returns the nodes that schema objects (tables, views, materialized views,
-	// dictionaries) are applied to: every node of the fan-out cluster, or this client only.
-	SchemaNodes(ctx context.Context) ([]SchemaNode, error)
-	FanoutCluster() string
+	// ForNode returns a client connected to another ClickHouse server, with this client's
+	// options. A port of 0 means the provider's port.
+	ForNode(host string, port uint16) (Client, error)
+	Host() string
 	AdoptExisting() bool
 	IgnoreColumnOrder() bool
 	ManageDictionaryPasswords() bool

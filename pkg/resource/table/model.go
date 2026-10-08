@@ -7,7 +7,8 @@ type TableResourceModel struct {
 	ClusterName            types.String `tfsdk:"cluster_name"`
 	ID                     types.String `tfsdk:"id"`
 	QualifiedName          types.String `tfsdk:"qualified_name"`
-	Nodes                  types.List   `tfsdk:"nodes"`
+	Node                   types.Object `tfsdk:"node"`
+	ReplicaRole            types.String `tfsdk:"replica_role"`
 	CreateStatement        types.String `tfsdk:"create_statement"`
 	Database               types.String `tfsdk:"database"`
 	Name                   types.String `tfsdk:"name"`
